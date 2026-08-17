@@ -479,7 +479,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             
             try:
                 req = urllib.request.Request(url, data=wrapped_body, headers=headers)
-                resp = urllib.request.urlopen(req, timeout=45)
+                resp = urllib.request.urlopen(req, timeout=120)
                 
                 success = True
                 
@@ -525,10 +525,16 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                 continue
                 
         if not success:
+            err_body = json.dumps({"error": f"All accounts failed. Last error: {last_err}"}).encode("utf-8")
             self.send_response(500)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_body)))
             self.end_headers()
-            self.wfile.write(json.dumps({"error": f"All accounts failed. Last error: {last_err}"}).encode("utf-8"))
+            try:
+                self.wfile.write(err_body)
+                self.wfile.flush()
+            except Exception:
+                pass
             return
 
         if stream:
