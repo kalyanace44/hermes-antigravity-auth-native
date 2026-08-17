@@ -221,7 +221,20 @@ def translate_openai_to_gemini(messages):
             parts = [{"text": " "}]
             
         contents.append({"role": role, "parts": parts})
-    return contents
+        
+    # Strictly merge consecutive turns of the same role for Gemini API compliance
+    merged_contents = []
+    for item in contents:
+        if merged_contents and merged_contents[-1]["role"] == item["role"]:
+            merged_contents[-1]["parts"].extend(item["parts"])
+        else:
+            merged_contents.append(item)
+
+    # Gemini API requires the first turn to be 'user'
+    if merged_contents and merged_contents[0]["role"] == "model":
+        merged_contents.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
+
+    return merged_contents
 
 DISPLAY_MODELS = [
     "gemini-3.7-flash",
