@@ -642,8 +642,11 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
             self.close_connection = True
         else:
             res_data = json.loads(resp.read().decode("utf-8"))
