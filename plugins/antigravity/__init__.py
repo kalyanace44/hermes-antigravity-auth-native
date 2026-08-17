@@ -177,34 +177,54 @@ def resolve_internal_model(model_name: str) -> str:
         return "gpt-oss-120b-medium"
     return MODEL_MAPPING.get(clean, "gemini-3.5-flash-low")
 
+UNSUPPORTED_SCHEMA_FIELDS = {
+    "additionalProperties", "$schema", "$id", "$comment", "$ref", "$defs",
+    "definitions", "const", "anyOf", "oneOf", "patternProperties",
+    "unevaluatedProperties", "unevaluatedItems", "dependentRequired"
+}
+
 def clean_param_schema(schema):
     if not isinstance(schema, dict):
         return {"type": "OBJECT"}
-    res = {}
-    stype = schema.get("type", "OBJECT")
-    if isinstance(stype, str):
-        res["type"] = stype.upper()
-    elif isinstance(stype, list):
-        res["type"] = "STRING"
-    else:
-        res["type"] = "OBJECT"
         
-    if "description" in schema and isinstance(schema["description"], str):
-        res["description"] = schema["description"]
+    if "anyOf" in schema or "oneOf" in schema:
+        options = schema.get("anyOf") or schema.get("oneOf")
+        best = next((opt for opt in options if isinstance(opt, dict) and opt.get("type") == "object"), options[0])
+        return clean_param_schema(best)
         
-    if "properties" in schema and isinstance(schema["properties"], dict):
-        res["properties"] = {k: clean_param_schema(v) for k, v in schema["properties"].items()}
+    result = {}
+    property_names = set()
+    if isinstance(schema.get("properties"), dict):
+        property_names = set(schema["properties"].keys())
         
-    if "required" in schema and isinstance(schema["required"], list):
-        res["required"] = [k for k in schema["required"] if isinstance(k, str)]
+    for key, value in schema.items():
+        if key in UNSUPPORTED_SCHEMA_FIELDS:
+            continue
+            
+        if key == "type" and isinstance(value, str):
+            result[key] = value.upper()
+        elif key == "properties" and isinstance(value, dict):
+            if value:
+                result[key] = {pk: clean_param_schema(pv) for pk, pv in value.items()}
+            else:
+                result[key] = {"_placeholder": {"type": "BOOLEAN", "description": "placeholder"}}
+        elif key == "items" and isinstance(value, dict):
+            result[key] = clean_param_schema(value)
+        elif key == "required" and isinstance(value, list):
+            valid_req = [prop for prop in value if isinstance(prop, str) and (prop in property_names or prop == "_placeholder")]
+            if valid_req:
+                result[key] = valid_req
+        elif key == "description" and isinstance(value, str):
+            result[key] = value
+        elif key in ("enum", "format", "default"):
+            result[key] = value
+            
+    if result.get("type") == "ARRAY" and "items" not in result:
+        result["items"] = {"type": "STRING"}
+    if "type" not in result:
+        result["type"] = "OBJECT"
         
-    if "items" in schema and isinstance(schema["items"], dict):
-        res["items"] = clean_param_schema(schema["items"])
-        
-    if "enum" in schema and isinstance(schema["enum"], list):
-        res["enum"] = [str(x) for x in schema["enum"]]
-        
-    return res
+    return result
 
 def translate_openai_tools_to_gemini(tools):
     if not tools:
@@ -229,53 +249,79 @@ def translate_openai_to_gemini(messages):
         content = msg.get("content")
         tool_calls = msg.get("tool_calls")
         
-        # Determine role (Google API expects USER or MODEL)
         role = "model" if raw_role == "assistant" else "user"
-        
         parts = []
-        if content is not None:
-            if isinstance(content, list):
-                for p in content:
-                    if isinstance(p, dict):
-                        if p.get("type") == "text":
-                            t = p.get("text", "")
-                            if t:
-                                parts.append({"text": t})
-                        elif p.get("type") == "image_url":
-                            img_obj = p.get("image_url", {})
-                            url_val = img_obj.get("url", "") if isinstance(img_obj, dict) else str(img_obj)
-                            if url_val.startswith("data:"):
-                                try:
-                                    header, b64_data = url_val.split(",", 1)
-                                    mime = header.split(";")[0].split(":")[1]
-                                    parts.append({"inlineData": {"mimeType": mime, "data": b64_data}})
-                                except Exception:
-                                    pass
-                    elif isinstance(p, str) and p:
-                        parts.append({"text": p})
-            elif isinstance(content, str) and content:
-                if raw_role == "tool":
-                    name = msg.get("name", "tool")
-                    parts.append({"text": f"[Tool Output for {name}]:\n{content}"})
-                elif raw_role in ("system", "developer"):
-                    parts.append({"text": f"[System Instructions]:\n{content}"})
-                else:
-                    parts.append({"text": content})
+        
+        if raw_role == "tool":
+            call_id = msg.get("tool_call_id") or f"call_{int(time.time()*1000)}"
+            try:
+                resp_data = json.loads(content) if isinstance(content, str) else content
+            except Exception:
+                resp_data = {"result": content}
+            if not isinstance(resp_data, dict) or resp_data is None or isinstance(resp_data, list):
+                resp_data = {"result": resp_data}
+            func_resp = {
+                "name": msg.get("name") or "tool_result",
+                "response": resp_data
+            }
+            if call_id:
+                func_resp["id"] = call_id
+            parts.append({"functionResponse": func_resp})
+        else:
+            if content is not None:
+                if isinstance(content, list):
+                    for p in content:
+                        if isinstance(p, dict):
+                            if p.get("type") == "text":
+                                t = p.get("text", "")
+                                if t:
+                                    parts.append({"text": t})
+                            elif p.get("type") == "image_url":
+                                img_obj = p.get("image_url", {})
+                                url_val = img_obj.get("url", "") if isinstance(img_obj, dict) else str(img_obj)
+                                if url_val.startswith("data:"):
+                                    try:
+                                        header, b64_data = url_val.split(",", 1)
+                                        mime = header.split(";")[0].split(":")[1]
+                                        parts.append({"inlineData": {"mimeType": mime, "data": b64_data}})
+                                    except Exception:
+                                        pass
+                        elif isinstance(p, str) and p:
+                            parts.append({"text": p})
+                elif isinstance(content, str) and content:
+                    if raw_role in ("system", "developer"):
+                        parts.append({"text": f"[System Instructions]:\n{content}"})
+                    else:
+                        parts.append({"text": content})
+                        
+            if tool_calls:
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "tool")
+                    call_id = tc.get("id") or f"call_{int(time.time()*1000)}"
+                    try:
+                        args = json.loads(fn.get("arguments", "{}")) if isinstance(fn.get("arguments"), str) else (fn.get("arguments") or {})
+                    except Exception:
+                        args = {}
+                    func_call = {
+                        "name": name,
+                        "args": args
+                    }
+                    if call_id:
+                        func_call["id"] = call_id
+                    part_obj = {"functionCall": func_call}
+                    with _sig_lock:
+                        sig = _thought_signatures.get(call_id)
+                    if sig:
+                        part_obj["thoughtSignature"] = sig
+                    parts.append(part_obj)
                     
-        if tool_calls:
-            for tc in tool_calls:
-                fn = tc.get("function", {})
-                name = fn.get("name", "tool")
-                args_raw = fn.get("arguments", "{}")
-                if not parts:
-                    parts.append({"text": f"[Action: {name}({args_raw})]"})
-                
         if not parts:
             parts = [{"text": " "}]
             
         contents.append({"role": role, "parts": parts})
         
-    # Strictly merge consecutive turns of the same role for Gemini API compliance
+    # Strictly merge consecutive turns of the same role for Gemini/Claude API compliance
     merged_contents = []
     for item in contents:
         if merged_contents and merged_contents[-1]["role"] == item["role"]:
@@ -283,7 +329,7 @@ def translate_openai_to_gemini(messages):
         else:
             merged_contents.append(item)
 
-    # Gemini API requires the first turn to be 'user'
+    # API requires the first turn to be 'user'
     if merged_contents and merged_contents[0]["role"] == "model":
         merged_contents.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
 
@@ -412,7 +458,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                 "contents": gemini_contents,
                 "generationConfig": gen_config
             }
-            if gemini_tools and family == "gemini":
+            if gemini_tools:
                 gemini_body["tools"] = gemini_tools
             
             req_dict = {
