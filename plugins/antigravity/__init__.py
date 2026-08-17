@@ -9,7 +9,7 @@ import socketserver
 import webbrowser
 import time
 import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ── Proxy Configuration ──────────────────────────────────────
 PROXY_PORT = 8999
@@ -725,7 +725,8 @@ def start_background_proxy():
         
     def run():
         try:
-            server = HTTPServer(('127.0.0.1', PROXY_PORT), AntigravityProxyHandler)
+            server = ThreadingHTTPServer(('127.0.0.1', PROXY_PORT), AntigravityProxyHandler)
+            server.daemon_threads = True
             server.serve_forever()
         except Exception:
             pass
