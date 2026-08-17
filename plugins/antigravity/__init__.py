@@ -117,10 +117,18 @@ MODEL_MAPPING = {
     # Gemini 3.7 & 3.5
     "gemini-3.7-flash": "gemini-3.5-flash-low",
     "gemini-3.7-flash-thinking": "gemini-3.5-flash-low",
+    "gemini-3.7-flash-medium": "gemini-3.5-flash-low",
+    "gemini-3.7-flash-high": "gemini-3.5-flash-low",
+    "gemini-3.7-flash-low": "gemini-3.5-flash-low",
     "gemini-3.5-flash": "gemini-3.5-flash-low",
+    "gemini-3.5-flash-medium": "gemini-3.5-flash-low",
+    "gemini-3.5-flash-high": "gemini-3.5-flash-low",
+    "gemini-3.5-flash-low": "gemini-3.5-flash-low",
     
     # Gemini 3.1 & 3 & 2.5
     "gemini-3.1-pro": "gemini-3.1-pro-low",
+    "gemini-3.1-pro-medium": "gemini-3.1-pro-low",
+    "gemini-3.1-pro-high": "gemini-3.1-pro-low",
     "gemini-3.1-pro-low": "gemini-3.1-pro-low",
     "gemini-3-flash": "gemini-3-flash",
     "gemini-2.5-flash": "gemini-2.5-flash",
@@ -128,20 +136,46 @@ MODEL_MAPPING = {
     # Claude Sonnet
     "claude-sonnet-4-6": "claude-sonnet-4-6",
     "claude-sonnet-4-6-thinking": "claude-sonnet-4-6",
+    "claude-sonnet-4-6-medium": "claude-sonnet-4-6",
+    "claude-sonnet-4-6-high": "claude-sonnet-4-6",
     "claude-3-5-sonnet": "claude-sonnet-4-6",
     "claude-3-5-sonnet-latest": "claude-sonnet-4-6",
     
     # Claude Opus
     "claude-opus-4-6": "claude-opus-4-6-thinking",
     "claude-opus-4-6-thinking": "claude-opus-4-6-thinking",
+    "claude-opus-4-6-medium": "claude-opus-4-6-thinking",
+    "claude-opus-4-6-high": "claude-opus-4-6-thinking",
     "claude-3-opus": "claude-opus-4-6-thinking",
     "claude-3-opus-latest": "claude-opus-4-6-thinking",
     
     # GPT OSS
     "gpt-oss-120b": "gpt-oss-120b-medium",
     "gpt-oss-120b-medium": "gpt-oss-120b-medium",
+    "gpt-oss-120b-high": "gpt-oss-120b-medium",
     "gpt-oss": "gpt-oss-120b-medium",
 }
+
+def resolve_internal_model(model_name: str) -> str:
+    m = model_name.lower().strip()
+    if m in MODEL_MAPPING:
+        return MODEL_MAPPING[m]
+    clean = m.replace("-medium", "").replace("-high", "").replace("-low", "").replace("-thinking", "")
+    if "3.7-flash" in clean or "3.5-flash" in clean:
+        return "gemini-3.5-flash-low"
+    if "3.1-pro" in clean or "3-pro" in clean:
+        return "gemini-3.1-pro-low"
+    if "3-flash" in clean:
+        return "gemini-3-flash"
+    if "2.5-flash" in clean:
+        return "gemini-2.5-flash"
+    if "sonnet" in clean:
+        return "claude-sonnet-4-6"
+    if "opus" in clean:
+        return "claude-opus-4-6-thinking"
+    if "gpt-oss" in clean:
+        return "gpt-oss-120b-medium"
+    return MODEL_MAPPING.get(clean, "gemini-3.5-flash-low")
 
 def clean_param_schema(schema):
     if not isinstance(schema, dict):
@@ -322,7 +356,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         req_model = req_json.get("model", "gemini-3.7-flash")
         is_claude = "claude" in req_model.lower()
         family = "claude" if is_claude else "gemini"
-        mapped_model = MODEL_MAPPING.get(req_model, req_model)
+        mapped_model = resolve_internal_model(req_model)
         
         success = False
         last_err = None
