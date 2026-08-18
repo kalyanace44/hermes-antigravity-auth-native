@@ -34,8 +34,15 @@ _project_cache = {}     # email -> project_id
 _cooldown_cache = {}    # "email:family" -> cooldown_until timestamp
 _consecutive_failures = {}  # "email:family" -> int count
 _thought_signatures = {}    # call_id -> signature
+_request_counts = {}    # "email:family" -> {"count": int, "window_start": float}
+_quota_limits = {}      # "email:family" -> int (learned from 429s)
+_quota_reset_at = {}    # "email:family" -> float (timestamp when quota resets)
 _cache_lock = threading.Lock()
 _sig_lock = threading.Lock()
+
+# Default assumed quota per hour (adjusted when we learn from 429s)
+DEFAULT_QUOTA_PER_HOUR = 50
+QUOTA_WARN_THRESHOLD = 0.90  # Warn at 90%
 
 # ── Isolated Account Store ────────────────────────────────────
 def get_accounts_file_path():
@@ -492,6 +499,13 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
 
                     with _cache_lock:
                         _consecutive_failures[cooldown_key] = 0
+                        # Track request count for quota warnings
+                        now = time.time()
+                        rc = _request_counts.get(cooldown_key)
+                        if not rc or (now - rc["window_start"]) > 3600:
+                            _request_counts[cooldown_key] = {"count": 1, "window_start": now}
+                        else:
+                            rc["count"] += 1
 
                     if idx != active_idx:
                         data["activeIndex"] = idx
@@ -501,7 +515,23 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                 except urllib.error.HTTPError as he:
                     status_code = he.code
                     err_text = he.read().decode("utf-8", errors="ignore")
-                    last_err = f"HTTP {status_code} on {email}: {err_text[:200]}"
+
+                    if status_code == 429:
+                        # Parse reset time from error message
+                        reset_match = re.search(r"Resets in (\d+)h(\d+)m(\d+)s", err_text)
+                        reset_secs = 3600  # default 1h
+                        if reset_match:
+                            h, m, s = int(reset_match.group(1)), int(reset_match.group(2)), int(reset_match.group(3))
+                            reset_secs = h * 3600 + m * 60 + s
+                        with _cache_lock:
+                            # Learn the quota limit from current count
+                            rc = _request_counts.get(cooldown_key)
+                            if rc and rc["count"] > 0:
+                                _quota_limits[cooldown_key] = rc["count"]
+                            _quota_reset_at[cooldown_key] = time.time() + reset_secs
+                        last_err = f"⚠️ QUOTA EXHAUSTED on {email} ({family}). Resets in {reset_secs // 60}m. Error: {err_text[:150]}"
+                    else:
+                        last_err = f"HTTP {status_code} on {email}: {err_text[:200]}"
 
                     if status_code in (429, 403, 503):
                         with _cache_lock:
@@ -537,13 +567,24 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             self._error_response(500, f"All accounts failed. Last error: {last_err}")
             return
 
+        # ── Check quota warning (90% threshold) ──────────────────
+        quota_warning = None
+        with _cache_lock:
+            rc = _request_counts.get(cooldown_key)
+            limit = _quota_limits.get(cooldown_key, DEFAULT_QUOTA_PER_HOUR)
+            if rc:
+                usage_pct = rc["count"] / limit
+                if usage_pct >= QUOTA_WARN_THRESHOLD:
+                    remaining = limit - rc["count"]
+                    quota_warning = f"⚠️ Antigravity quota at {int(usage_pct * 100)}% ({rc['count']}/{limit} requests this hour). ~{remaining} requests remaining."
+
         # ── Handle response ───────────────────────────────────
         if stream:
-            self._handle_stream_response(resp, req_model)
+            self._handle_stream_response(resp, req_model, quota_warning)
         else:
-            self._handle_sync_response(resp, req_model)
+            self._handle_sync_response(resp, req_model, quota_warning)
 
-    def _handle_sync_response(self, resp, req_model):
+    def _handle_sync_response(self, resp, req_model, quota_warning=None):
         """Parse non-streaming Gemini response → OpenAI format."""
         try:
             res_data = json.loads(resp.read().decode("utf-8"))
@@ -588,6 +629,13 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             "model": req_model,
             "choices": [{"index": 0, "message": msg_obj, "finish_reason": finish_reason}]
         }
+        if quota_warning:
+            openai_resp["quota_warning"] = quota_warning
+            # Append warning to content so user sees it
+            if msg_obj.get("content"):
+                msg_obj["content"] += f"\n\n---\n{quota_warning}"
+            elif not tool_calls:
+                msg_obj["content"] = quota_warning
         resp_bytes = json.dumps(openai_resp).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -596,7 +644,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(resp_bytes)
         self.wfile.flush()
 
-    def _handle_stream_response(self, resp, req_model):
+    def _handle_stream_response(self, resp, req_model, quota_warning=None):
         """Parse streaming Gemini SSE → OpenAI SSE format."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -682,6 +730,17 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             try:
+                # Send quota warning as a final text chunk if threshold exceeded
+                if quota_warning:
+                    warn_chunk = {
+                        "id": f"chatcmpl-{int(time.time()*1000)}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req_model,
+                        "choices": [{"delta": {"content": f"\n\n---\n{quota_warning}"}, "index": 0, "finish_reason": None}]
+                    }
+                    self.wfile.write(f"data: {json.dumps(warn_chunk)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except Exception:
