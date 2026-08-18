@@ -480,42 +480,56 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                 "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}'
             }
 
-            try:
-                http_req = urllib.request.Request(url, data=json.dumps(req_dict).encode("utf-8"), headers=headers)
-                resp = urllib.request.urlopen(http_req, timeout=120)
-                success = True
+            # Retry transient network errors (SSL EOF, connection reset, timeout)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    http_req = urllib.request.Request(url, data=json.dumps(req_dict).encode("utf-8"), headers=headers)
+                    resp = urllib.request.urlopen(http_req, timeout=120)
+                    success = True
 
-                with _cache_lock:
-                    _consecutive_failures[cooldown_key] = 0
+                    with _cache_lock:
+                        _consecutive_failures[cooldown_key] = 0
 
-                if idx != active_idx:
-                    data["activeIndex"] = idx
-                    save_accounts_data(data)
+                    if idx != active_idx:
+                        data["activeIndex"] = idx
+                        save_accounts_data(data)
+                    break
+
+                except urllib.error.HTTPError as he:
+                    status_code = he.code
+                    err_text = he.read().decode("utf-8", errors="ignore")
+                    last_err = f"HTTP {status_code} on {email}: {err_text[:200]}"
+
+                    if status_code in (429, 403, 503):
+                        with _cache_lock:
+                            failures = _consecutive_failures.get(cooldown_key, 0) + 1
+                            _consecutive_failures[cooldown_key] = failures
+                            cooldown_duration = {1: 60, 2: 300, 3: 1800}.get(failures, 7200)
+                            _cooldown_cache[cooldown_key] = time.time() + cooldown_duration
+                            _token_cache.pop(email, None)
+                            _project_cache.pop(email, None)
+
+                    if status_code == 401:
+                        with _cache_lock:
+                            _token_cache.pop(email, None)
+                            _project_cache.pop(email, None)
+
+                    break  # HTTP errors are not retryable (except via account rotation)
+
+                except Exception as e:
+                    last_err = f"Request error on {email}: {e}"
+                    is_transient = any(s in str(e) for s in [
+                        "SSL", "EOF", "Connection reset", "timed out",
+                        "Connection refused", "Temporary failure"
+                    ])
+                    if is_transient and attempt < max_retries - 1:
+                        time.sleep(1 * (attempt + 1))  # 1s, 2s backoff
+                        continue
+                    break
+
+            if success:
                 break
-
-            except urllib.error.HTTPError as he:
-                status_code = he.code
-                err_text = he.read().decode("utf-8", errors="ignore")
-                last_err = f"HTTP {status_code} on {email}: {err_text[:200]}"
-
-                if status_code in (429, 403, 503):
-                    with _cache_lock:
-                        failures = _consecutive_failures.get(cooldown_key, 0) + 1
-                        _consecutive_failures[cooldown_key] = failures
-                        cooldown_duration = {1: 60, 2: 300, 3: 1800}.get(failures, 7200)
-                        _cooldown_cache[cooldown_key] = time.time() + cooldown_duration
-                        _token_cache.pop(email, None)
-                        _project_cache.pop(email, None)
-
-                if status_code == 401:
-                    with _cache_lock:
-                        _token_cache.pop(email, None)
-                        _project_cache.pop(email, None)
-
-                continue
-            except Exception as e:
-                last_err = f"Request error on {email}: {e}"
-                continue
 
         if not success:
             self._error_response(500, f"All accounts failed. Last error: {last_err}")
