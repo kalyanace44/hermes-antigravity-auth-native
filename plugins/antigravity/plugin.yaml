@@ -1,7 +1,7 @@
 name: antigravity
 display_name: "Google Antigravity"
-version: 1.0.0
-description: "Native Google Antigravity OAuth and high-speed gateway plugin for Hermes Agent"
+version: 2.0.0
+description: "Native Google Antigravity OAuth and streaming plugin for Hermes Agent with isolated account store"
 author: "Kalyan (kalyanace44)"
 homepage: "https://github.com/kalyanace44/hermes-antigravity-auth-native"
 main: "__init__.py"

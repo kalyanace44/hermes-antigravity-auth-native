@@ -2,35 +2,42 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Hermes Agent](https://img.shields.io/badge/Hermes-Plugin-blue.svg)](https://hermesagent.com)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-green.svg)](https://cloud.google.com)
 
-> Native Hermes Agent plugin to authenticate with Google Antigravity (Google Cloud Code PA) and query **Gemini 3.7 Flash**, **Claude 4.6 Sonnet**, **Claude Opus 4.6**, and **GPT-OSS 120B** directly using your Google account pool.
+> Native Hermes Agent plugin for **Google Antigravity** (Gemini 3.7, Claude Sonnet/Opus, GPT-OSS) with an **isolated account store** that never interferes with your Antigravity CLI/IDE sessions.
 
 ---
 
-## ✨ Key Improvements in `hermes-antigravity-auth-native`
+## ✨ Features
 
-- ⚡ **Zero-Latency Stream Unbuffered SSE**: Fixes the upstream Google HTTP keep-alive connection hang by immediately terminating and closing streams upon `finishReason` or `tool_calls`.
-- 🛠️ **Rock-Solid Tool Calling Schema**: Sanitizes and normalizes OpenAI-format parameter schemas to uppercase JSON types (`OBJECT`, `STRING`, `ARRAY`), stripping unsupported `$schema` and `additionalProperties` keywords that trigger upstream HTTP 400 rejections.
-- 🧠 **Multi-Turn `thoughtSignature` Resolution**: Prevents Google 400 rejections during multi-turn agent tool executions by cleanly separating tool action tags in conversation history.
-- 🔒 **Account Isolation**: Completely decouples Hermes's OAuth accounts (`~/.hermes/antigravity-accounts.json`) from Antigravity CLI's default configuration, preventing session conflicts and platform path bugs.
-- 🗂️ **Deduplicated Model List**: Eliminates duplicate `-thinking` UI rows while preserving full dynamic reasoning effort control (`Low`, `Med`, `High`, `Max`) in the Hermes model selector.
+- 🔒 **Isolated Account Store**: `~/.hermes/antigravity-accounts.json` — independent from Antigravity CLI
+- 🚀 **Self-Healing Proxy**: Auto-starts on port `8999` when Hermes loads
+- 🔄 **Account Rotation**: Automatic failover with cooldown on rate limits
+- 🧠 **Thinking Model Fix**: Enforces minimum 16384 output tokens so thinking models don't starve
+- ⚡ **SSE Streaming**: Real-time token streaming with sub-100ms first-token
+- 🛠️ **Tool Use Support**: Full function calling with thoughtSignature preservation
 
 ---
 
 ## 🤖 Supported Models
 
-| Model Name in Hermes | Architecture / Family | Features |
-|---|---|---|
-| `gemini-3.7-flash` | Gemini 3.7 Flash | Hybrid reasoning, coding, high speed |
-| `claude-sonnet-4-6` | Anthropic Claude 4.6 Sonnet | High intelligence, software engineering |
-| `claude-opus-4-6` | Anthropic Claude 4.6 Opus | Deep reasoning & architecture planning |
-| `claude-3-5-sonnet` | Claude 3.5 Sonnet | Reliable coding baseline |
-| `claude-3-opus` | Claude 3 Opus | Complex logic & system design |
-| `gpt-oss-120b` | GPT-OSS 120B | Open-weight frontier reasoning |
-| `gemini-3.1-pro` | Gemini 3.1 Pro | Deep analysis & multimodal tasks |
-| `gemini-3-flash` | Gemini 3 Flash | Ultra-fast utility model |
-| `gemini-2.5-flash` | Gemini 2.5 Flash | Lightweight low-latency model |
+| Model | Backend |
+|-------|---------|
+| `gemini-3.7-flash` | Gemini 3.5 Flash (thinking) |
+| `claude-sonnet-4-6` | Claude Sonnet 4.6 |
+| `claude-opus-4-6` | Claude Opus 4.6 (thinking) |
+| `gpt-oss-120b` | GPT OSS 120B |
+| `gemini-3.1-pro` | Gemini 3.1 Pro |
+| `gemini-3-flash` | Gemini 3 Flash |
+| `gemini-2.5-flash` | Gemini 2.5 Flash |
+
+---
+
+## 💬 Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/antigravity-login` | OAuth login via browser — stores refresh token in isolated store |
+| `/antigravity-accounts` | View account status, proxy health |
 
 ---
 
@@ -52,39 +59,36 @@ chmod +x install.sh && ./install.sh
 
 ---
 
-## 🔑 Account Management
+## 🔍 Architecture
 
-Inside the Hermes chat window:
-
-1. **Log in with any Google account**:
-   ```text
-   /antigravity-login
-   ```
-2. **List and switch accounts**:
-   ```text
-   /antigravity-accounts
-   ```
+```
+┌─────────────────┐       OpenAI-compatible API       ┌────────────────────────┐
+│  Hermes Agent   │  ──────────────────────────────> │  Antigravity Plugin    │
+│  (Desktop/CLI)  │  <────────────────────────────── │  (Port 8999)           │
+└─────────────────┘                                   └───────────┬────────────┘
+                                                                  │
+                                         Google OAuth + Refresh   │ (Isolated Store:
+                                         Token from JSON file     │  ~/.hermes/antigravity-accounts.json)
+                                                                  ▼
+                                                      ┌────────────────────────┐
+                                                      │  Google Antigravity    │
+                                                      │  (daily-cloudcode API) │
+                                                      └────────────────────────┘
+```
 
 ---
 
-## 🔍 Architecture Overview
+## 🛠️ Verification
 
-```
-┌─────────────────┐       OpenAI SSE Stream        ┌────────────────────────┐
-│  Hermes Agent   │  ────────────────────────────> │ Antigravity Plugin     │
-│  (Desktop / CLI)│  <──────────────────────────── │ (Port 8999 Proxy)      │
-└─────────────────┘                                └───────────┬────────────┘
-                                                               │
-                                          OAuth2 Token Pool &  │
-                                          Schema Normalizer    ▼
-                                                   ┌────────────────────────┐
-                                                   │  Google Cloud Code PA  │
-                                                   │  (Gemini & Claude)     │
-                                                   └────────────────────────┘
+```bash
+curl http://127.0.0.1:8999/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer mock" \
+  -d '{"model": "gemini-3.7-flash", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
 ---
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+MIT License — see [LICENSE](LICENSE).

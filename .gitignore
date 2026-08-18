@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-*.log
-.DS_Store
 .env
-antigravity-accounts.json
+*.egg-info/
+dist/
+build/
