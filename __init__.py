@@ -455,6 +455,8 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             with _cache_lock:
                 cooldown_until = _cooldown_cache.get(cooldown_key, 0)
             if time.time() < cooldown_until:
+                remaining = int(cooldown_until - time.time())
+                last_err = f"Account {email} in cooldown ({remaining}s remaining)"
                 continue
 
             try:
@@ -866,6 +868,45 @@ def handle_antigravity_accounts(args):
 
 
 # ── Plugin Registration ───────────────────────────────────────
+def handle_antigravity_quota(args):
+    """Show cooldown/quota status for all accounts."""
+    data = load_accounts_data()
+    accounts = data.get("accounts", [])
+    if not accounts:
+        return "No accounts configured. Use `/antigravity-login` to authenticate."
+
+    lines = ["**Antigravity Quota Status**\n"]
+    now = time.time()
+    families = ["gemini", "claude"]
+
+    for acct in accounts:
+        email = acct.get("email", "?")
+        enabled = "✅" if acct.get("enabled", True) else "❌"
+        lines.append(f"**{email}** {enabled}")
+
+        for family in families:
+            cooldown_key = f"{email}:{family}"
+            with _cache_lock:
+                cooldown_until = _cooldown_cache.get(cooldown_key, 0)
+                failures = _consecutive_failures.get(cooldown_key, 0)
+            if now < cooldown_until:
+                remaining = int(cooldown_until - now)
+                mins, secs = divmod(remaining, 60)
+                lines.append(f"  {family}: ⏳ Cooldown {mins}m{secs}s (failures: {failures})")
+            else:
+                lines.append(f"  {family}: ✅ Ready")
+
+    # Option to clear cooldowns
+    if args and args.strip() == "clear":
+        with _cache_lock:
+            _cooldown_cache.clear()
+            _consecutive_failures.clear()
+        lines.append("\n🧹 All cooldowns cleared!")
+
+    lines.append("\n💡 Use `/antigravity-quota clear` to reset cooldowns.")
+    return "\n".join(lines)
+
+
 def register(ctx):
     ctx.register_command(
         "antigravity-login",
@@ -876,6 +917,11 @@ def register(ctx):
         "antigravity-accounts",
         handler=handle_antigravity_accounts,
         description="View Hermes Antigravity account status"
+    )
+    ctx.register_command(
+        "antigravity-quota",
+        handler=handle_antigravity_quota,
+        description="View quota/cooldown status and optionally clear cooldowns"
     )
 
 
