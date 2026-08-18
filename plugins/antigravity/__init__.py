@@ -343,14 +343,11 @@ def translate_openai_to_gemini(messages):
                     func_call = {"name": name, "args": args}
                     if call_id:
                         func_call["id"] = call_id
-                    # Look up thought signature: in-memory cache first, then
-                    # extra_content persisted by Hermes in the DB (survives restart)
+                    # Look up thought signature: ONLY trust in-memory cache
+                    # (from current session responses). DB-stored signatures become
+                    # invalid after account switch or restart — degrade to text.
                     with _sig_lock:
                         sig = _thought_signatures.get(call_id)
-                    if not sig:
-                        extra = tc.get("extra_content") or {}
-                        google_extra = extra.get("google") or {}
-                        sig = google_extra.get("thought_signature") or google_extra.get("thoughtSignature")
                     if sig:
                         part_obj = {"functionCall": func_call, "thoughtSignature": sig}
                         parts.append(part_obj)
@@ -515,6 +512,26 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                 except urllib.error.HTTPError as he:
                     status_code = he.code
                     err_text = he.read().decode("utf-8", errors="ignore")
+
+                    if status_code == 400:
+                        # Dump failed request for debugging
+                        import datetime
+                        debug_path = os.path.expanduser("~/.hermes/logs/antigravity-400-debug.json")
+                        try:
+                            with open(debug_path, "w") as df:
+                                json.dump({
+                                    "timestamp": datetime.datetime.now().isoformat(),
+                                    "model": mapped_model,
+                                    "email": email,
+                                    "error": err_text[:500],
+                                    "num_contents": len(gemini_body.get("contents", [])),
+                                    "num_tools": len(gemini_body.get("tools", [])) if gemini_body.get("tools") else 0,
+                                    "request_size_bytes": len(json.dumps(req_dict)),
+                                    "first_3_contents": gemini_body.get("contents", [])[:3],
+                                    "last_3_contents": gemini_body.get("contents", [])[-3:],
+                                }, df, indent=2, default=str)
+                        except Exception:
+                            pass
 
                     if status_code == 429:
                         # Parse reset time from error message
