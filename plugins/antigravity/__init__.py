@@ -191,13 +191,23 @@ UNSUPPORTED_SCHEMA_FIELDS = {
 }
 
 
-def clean_param_schema(schema):
+def clean_param_schema(schema, depth=0):
+    """Clean OpenAI tool schema to be Gemini-compatible. Strips unsupported fields, handles edge cases."""
+    if depth > 8:
+        return {"type": "STRING", "description": "complex nested value"}
     if not isinstance(schema, dict):
-        return {"type": "OBJECT"}
+        return {"type": "STRING"}
     if "anyOf" in schema or "oneOf" in schema:
         options = schema.get("anyOf") or schema.get("oneOf")
-        best = next((opt for opt in options if isinstance(opt, dict) and opt.get("type") == "object"), options[0])
-        return clean_param_schema(best)
+        if isinstance(options, list) and options:
+            best = next((opt for opt in options if isinstance(opt, dict) and opt.get("type") == "object"), None)
+            if best:
+                return clean_param_schema(best, depth + 1)
+            # Just take first valid option
+            for opt in options:
+                if isinstance(opt, dict):
+                    return clean_param_schema(opt, depth + 1)
+        return {"type": "STRING", "description": "union type"}
     result = {}
     property_names = set()
     if isinstance(schema.get("properties"), dict):
@@ -209,11 +219,18 @@ def clean_param_schema(schema):
             result[key] = value.upper()
         elif key == "properties" and isinstance(value, dict):
             if value:
-                result[key] = {pk: clean_param_schema(pv) for pk, pv in value.items()}
+                result[key] = {pk: clean_param_schema(pv, depth + 1) for pk, pv in value.items()}
             else:
-                result[key] = {"_placeholder": {"type": "BOOLEAN", "description": "placeholder"}}
+                # Empty properties object — Gemini requires at least one property
+                result[key] = {"_placeholder": {"type": "STRING", "description": "optional value"}}
         elif key == "items" and isinstance(value, dict):
-            result[key] = clean_param_schema(value)
+            result[key] = clean_param_schema(value, depth + 1)
+        elif key == "items" and isinstance(value, list):
+            # Array items as list — take first
+            if value and isinstance(value[0], dict):
+                result[key] = clean_param_schema(value[0], depth + 1)
+            else:
+                result[key] = {"type": "STRING"}
         elif key == "required" and isinstance(value, list):
             valid_req = [p for p in value if isinstance(p, str) and (p in property_names or p == "_placeholder")]
             if valid_req:
