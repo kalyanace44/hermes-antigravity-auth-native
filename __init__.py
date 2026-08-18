@@ -271,7 +271,66 @@ def translate_openai_tools_to_gemini(tools):
 
 
 # ── Message Translation ───────────────────────────────────────
+# Max approximate chars to send (Gemini 3.5 flash ~1M tokens, but safer to stay under)
+MAX_CONTEXT_CHARS = 900_000  # ~225K tokens at 4 chars/token
+
+def _compact_messages(messages):
+    """Compact large message histories to fit within context limits.
+    
+    Strategy:
+    - Always keep system messages, first 5 and last 80 messages at full fidelity
+    - Middle messages: drop tool calls/results entirely, truncate text to 300 chars
+    - If still too large: drop middle section entirely
+    """
+    if len(messages) <= 100:
+        return messages  # Small enough, no compaction needed
+
+    # Estimate total size
+    total_chars = sum(len(json.dumps(m, default=str)) for m in messages)
+    if total_chars <= MAX_CONTEXT_CHARS:
+        return messages  # Fits within budget
+
+    # Split: system + first 5 | middle | last 80
+    system_msgs = [m for m in messages if m.get("role") in ("system", "developer")]
+    non_system = [m for m in messages if m.get("role") not in ("system", "developer")]
+
+    if len(non_system) <= 85:
+        return messages
+
+    head = non_system[:5]
+    tail = non_system[-80:]
+    middle = non_system[5:-80]
+
+    # Compact middle: keep only user/assistant text, drop tool messages
+    compacted_middle = []
+    for msg in middle:
+        role = msg.get("role", "")
+        if role == "tool":
+            continue  # Drop tool results
+        if msg.get("tool_calls"):
+            continue  # Drop tool call turns
+        content = msg.get("content")
+        if content and isinstance(content, str) and content.strip():
+            truncated = content[:300] + "…" if len(content) > 300 else content
+            compacted_middle.append({"role": role, "content": truncated})
+
+    # Add a separator to mark compaction
+    separator = {"role": "user", "content": "[Earlier conversation compacted to save context. Recent messages below.]"}
+
+    result = system_msgs + head + [separator] + compacted_middle + tail
+
+    # If STILL too large, drop compacted middle entirely
+    result_chars = sum(len(json.dumps(m, default=str)) for m in result)
+    if result_chars > MAX_CONTEXT_CHARS:
+        result = system_msgs + head + [separator] + tail
+
+    return result
+
+
 def translate_openai_to_gemini(messages):
+    # Apply compaction before translation
+    messages = _compact_messages(messages)
+
     contents = []
     # Track call_ids that were degraded to text (no thought signature)
     _degraded_call_ids = set()
