@@ -345,13 +345,8 @@ def translate_openai_to_gemini(messages):
         if raw_role == "tool":
             call_id = msg.get("tool_call_id") or f"call_{int(time.time()*1000)}"
             if call_id in _degraded_call_ids:
-                # Matching call was degraded to text — render result as text too
-                tool_name = msg.get("name") or "tool_result"
-                result_text = content if isinstance(content, str) else json.dumps(content)
-                # Keep it very short to save context window
-                if len(result_text) > 200:
-                    result_text = result_text[:200] + "…"
-                parts.append({"text": f"[result:{tool_name}={result_text}]"})
+                # Matching call was degraded — skip result entirely
+                continue
             else:
                 try:
                     resp_data = json.loads(content) if isinstance(content, str) else content
@@ -411,10 +406,9 @@ def translate_openai_to_gemini(messages):
                         part_obj = {"functionCall": func_call, "thoughtSignature": sig}
                         parts.append(part_obj)
                     else:
-                        # No signature available (lost on restart) — convert to text
-                        # so Google doesn't reject the request
+                        # No signature available (lost on restart) — skip entirely
+                        # Don't render as text — Gemini confuses it with its own output
                         _degraded_call_ids.add(call_id)
-                        parts.append({"text": f"[tool:{name}]"})
 
         if not parts:
             parts = [{"text": " "}]
