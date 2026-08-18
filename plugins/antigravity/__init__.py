@@ -41,8 +41,37 @@ _cache_lock = threading.Lock()
 _sig_lock = threading.Lock()
 
 # Default assumed quota per hour (adjusted when we learn from 429s)
-DEFAULT_QUOTA_PER_HOUR = 50
+DEFAULT_QUOTA_PER_HOUR = 1000  # High default — don't warn until we learn the real limit
 QUOTA_WARN_THRESHOLD = 0.90  # Warn at 90%
+QUOTA_FILE = os.path.expanduser("~/.hermes/antigravity-quota.json")
+
+
+def _load_quota_limits():
+    """Load learned quota limits from disk (survives restart)."""
+    if os.path.exists(QUOTA_FILE):
+        try:
+            with open(QUOTA_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_quota_limits():
+    """Persist learned quota limits to disk."""
+    try:
+        data = {}
+        with _cache_lock:
+            data = dict(_quota_limits)
+        os.makedirs(os.path.dirname(QUOTA_FILE), exist_ok=True)
+        with open(QUOTA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+# Load learned limits on startup
+_quota_limits = _load_quota_limits()
 
 # ── Isolated Account Store ────────────────────────────────────
 def get_accounts_file_path():
@@ -598,6 +627,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                             if rc and rc["count"] > 0:
                                 _quota_limits[cooldown_key] = rc["count"]
                             _quota_reset_at[cooldown_key] = time.time() + reset_secs
+                        _save_quota_limits()
                         last_err = f"⚠️ QUOTA EXHAUSTED on {email} ({family}). Resets in {reset_secs // 60}m. Error: {err_text[:150]}"
                     else:
                         last_err = f"HTTP {status_code} on {email}: {err_text[:200]}"
@@ -972,6 +1002,14 @@ def perform_oauth_flow():
 def handle_antigravity_login(args):
     try:
         success, msg = perform_oauth_flow()
+        if success:
+            # Reset quota counters for the new account — fresh quota
+            with _cache_lock:
+                _request_counts.clear()
+                _cooldown_cache.clear()
+                _consecutive_failures.clear()
+                _quota_reset_at.clear()
+            # Don't clear _quota_limits — those are learned and persist
         return msg
     except Exception as e:
         return f"❌ Login error: {e}"
