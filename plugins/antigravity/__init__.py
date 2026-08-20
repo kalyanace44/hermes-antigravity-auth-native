@@ -457,6 +457,10 @@ def translate_openai_to_gemini(messages):
     if merged and merged[0]["role"] == "model":
         merged.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
 
+    # Claude via Antigravity rejects assistant prefill — last turn must be 'user'
+    if merged and merged[-1]["role"] == "model":
+        merged = merged[:-1]  # Drop trailing model message (it's stale/incomplete anyway)
+
     return merged
 
 
