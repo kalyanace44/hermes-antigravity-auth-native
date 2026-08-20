@@ -505,11 +505,21 @@ def translate_openai_to_gemini(messages):
             continue
         contents.append({"role": role, "parts": parts})
 
-    # Merge consecutive same-role turns
+    # Merge consecutive same-role turns (but keep functionResponse separate from text)
     merged = []
     for item in contents:
         if merged and merged[-1]["role"] == item["role"]:
-            merged[-1]["parts"].extend(item["parts"])
+            # Don't merge if either side has functionResponse mixed with text
+            prev_has_func_resp = any("functionResponse" in p for p in merged[-1]["parts"])
+            curr_has_func_resp = any("functionResponse" in p for p in item["parts"])
+            prev_has_text = any("text" in p for p in merged[-1]["parts"])
+            curr_has_text = any("text" in p for p in item["parts"])
+
+            if (prev_has_func_resp and curr_has_text) or (prev_has_text and curr_has_func_resp):
+                # Split: keep separate to avoid mixing functionResponse with text
+                merged.append(item)
+            else:
+                merged[-1]["parts"].extend(item["parts"])
         else:
             merged.append(item)
 
