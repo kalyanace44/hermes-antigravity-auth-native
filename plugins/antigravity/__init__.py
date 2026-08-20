@@ -13,6 +13,9 @@ import socketserver
 import webbrowser
 import time
 import re
+import logging
+
+logger = logging.getLogger("antigravity")
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
