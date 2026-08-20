@@ -129,15 +129,24 @@ def load_project_id(access_token):
         "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     }
     req = urllib.request.Request(url, data=body, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            res_data = json.loads(resp.read().decode("utf-8"))
-            project_field = res_data.get("cloudaicompanionProject")
-            if isinstance(project_field, dict):
-                return project_field.get("id")
-            return project_field
-    except Exception:
-        return None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                project_field = res_data.get("cloudaicompanionProject")
+                if isinstance(project_field, dict):
+                    pid = project_field.get("id")
+                else:
+                    pid = project_field
+                if pid:
+                    return pid
+                # Project field empty — log and retry
+                logger.warning(f"[Antigravity] loadCodeAssist returned empty project: {res_data}")
+        except Exception as e:
+            logger.warning(f"[Antigravity] loadCodeAssist attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(1)
+    return None
 
 
 def get_auth_credentials(account):
@@ -153,6 +162,13 @@ def get_auth_credentials(account):
         with _cache_lock:
             _token_cache[email] = token
             _project_cache[email] = project_id
+
+    # If we have a token but no project, try loading project again
+    if token and not project_id:
+        project_id = load_project_id(token)
+        if project_id:
+            with _cache_lock:
+                _project_cache[email] = project_id
 
     return token, project_id
 
