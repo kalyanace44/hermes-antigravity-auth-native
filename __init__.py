@@ -1012,7 +1012,17 @@ def perform_oauth_flow():
 
 # ── Slash Command Handlers ────────────────────────────────────
 def handle_antigravity_login(args):
+    global _oauth_server
     try:
+        # Kill any previous running OAuth server (stale from timed-out login)
+        if _oauth_server is not None:
+            try:
+                _oauth_server.shutdown()
+                _oauth_server.server_close()
+            except Exception:
+                pass
+            _oauth_server = None
+
         success, msg = perform_oauth_flow()
         if success:
             # Reset quota counters for the new account — fresh quota
@@ -1025,6 +1035,31 @@ def handle_antigravity_login(args):
         return msg
     except Exception as e:
         return f"❌ Login error: {e}"
+
+
+def handle_antigravity_switch(args):
+    """Switch active account by index."""
+    if not args or not args.strip().isdigit():
+        return "Usage: `/antigravity-switch <index>` — use `/antigravity-accounts` to see indices."
+
+    idx = int(args.strip())
+    data = load_accounts_data()
+    accounts = data.get("accounts", [])
+
+    if idx < 0 or idx >= len(accounts):
+        return f"❌ Invalid index {idx}. You have {len(accounts)} accounts (0-{len(accounts)-1})."
+
+    data["activeIndex"] = idx
+    save_accounts_data(data)
+    email = accounts[idx].get("email", "?")
+
+    # Clear cooldowns so the switched account is tried immediately
+    with _cache_lock:
+        _cooldown_cache.clear()
+        _consecutive_failures.clear()
+        _request_counts.clear()
+
+    return f"✅ Switched active account to **{email}** (index {idx}). Cooldowns cleared."
 
 
 def handle_antigravity_accounts(args):
@@ -1090,6 +1125,11 @@ def register(ctx):
         "antigravity-login",
         handler=handle_antigravity_login,
         description="Login to Google Antigravity for Hermes — isolated from Antigravity IDE"
+    )
+    ctx.register_command(
+        "antigravity-switch",
+        handler=handle_antigravity_switch,
+        description="Switch active Antigravity account by index"
     )
     ctx.register_command(
         "antigravity-accounts",
