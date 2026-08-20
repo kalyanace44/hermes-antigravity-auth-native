@@ -421,6 +421,7 @@ def translate_openai_to_gemini(messages):
     messages = _compact_messages(messages)
 
     contents = []
+    system_parts = []  # Collect system/developer messages separately
     # Track call_ids that were degraded to text (no thought signature)
     _degraded_call_ids = set()
 
@@ -430,6 +431,12 @@ def translate_openai_to_gemini(messages):
         tool_calls = msg.get("tool_calls")
         role = "model" if raw_role == "assistant" else "user"
         parts = []
+
+        # Collect system messages into systemInstruction
+        if raw_role in ("system", "developer"):
+            if content and isinstance(content, str) and content.strip():
+                system_parts.append({"text": content})
+            continue
 
         if raw_role == "tool":
             call_id = msg.get("tool_call_id") or f"call_{int(time.time()*1000)}"
@@ -469,10 +476,7 @@ def translate_openai_to_gemini(messages):
                         elif isinstance(p, str) and p:
                             parts.append({"text": p})
                 elif isinstance(content, str) and content.strip():
-                    if raw_role in ("system", "developer"):
-                        parts.append({"text": f"[System Instructions]:\n{content}"})
-                    else:
-                        parts.append({"text": content})
+                    parts.append({"text": content})
 
             if tool_calls:
                 for tc in tool_calls:
@@ -580,7 +584,7 @@ def translate_openai_to_gemini(messages):
     if merged and merged[-1]["role"] == "model":
         merged = merged[:-1]  # Drop trailing model message (it's stale/incomplete anyway)
 
-    return merged
+    return merged, system_parts
 
 
 # ── Proxy Handler ─────────────────────────────────────────────
@@ -628,7 +632,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         stream = req_json.get("stream", False)
 
         # Build Gemini request
-        gemini_contents = translate_openai_to_gemini(req_json.get("messages", []))
+        gemini_contents, system_instruction = translate_openai_to_gemini(req_json.get("messages", []))
         gemini_tools = translate_openai_tools_to_gemini(req_json.get("tools"))
 
         gen_config = {}
@@ -645,6 +649,8 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             gen_config["maxOutputTokens"] = MIN_OUTPUT_TOKENS
 
         gemini_body = {"contents": gemini_contents, "generationConfig": gen_config}
+        if system_instruction:
+            gemini_body["systemInstruction"] = {"parts": system_instruction}
         if gemini_tools:
             gemini_body["tools"] = gemini_tools
 
