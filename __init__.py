@@ -143,12 +143,22 @@ def load_project_id(access_token):
                     pid = project_field
                 if pid:
                     return pid
-                # Project field empty — log and retry
                 logger.warning(f"[Antigravity] loadCodeAssist returned empty project: {res_data}")
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode("utf-8", errors="ignore")[:200]
+            logger.warning(f"[Antigravity] loadCodeAssist HTTP {he.code}: {err_body}")
+            # Dump to file for debugging
+            try:
+                debug_path = os.path.expanduser("~/.hermes/logs/antigravity-project-debug.json")
+                os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+                with open(debug_path, "w") as df:
+                    json.dump({"attempt": attempt, "status": he.code, "body": err_body}, df)
+            except Exception:
+                pass
         except Exception as e:
             logger.warning(f"[Antigravity] loadCodeAssist attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                time.sleep(1)
+        if attempt < 2:
+            time.sleep(1)
     return None
 
 
@@ -165,15 +175,46 @@ def get_auth_credentials(account):
         with _cache_lock:
             _token_cache[email] = token
             _project_cache[email] = project_id
+        # Persist project_id in accounts file
+        if project_id:
+            _save_project_to_account(email, project_id)
 
-    # If we have a token but no project, try loading project again
+    # If we have a token but no project, try stored project first, then API
     if token and not project_id:
-        project_id = load_project_id(token)
+        project_id = _load_project_from_account(email)
+        if not project_id:
+            project_id = load_project_id(token)
         if project_id:
             with _cache_lock:
                 _project_cache[email] = project_id
+            _save_project_to_account(email, project_id)
 
     return token, project_id
+
+
+def _save_project_to_account(email, project_id):
+    """Persist project_id in accounts file so it survives restarts."""
+    try:
+        data = load_accounts_data()
+        for acct in data.get("accounts", []):
+            if acct.get("email") == email:
+                acct["projectId"] = project_id
+                break
+        save_accounts_data(data)
+    except Exception:
+        pass
+
+
+def _load_project_from_account(email):
+    """Load previously stored project_id from accounts file."""
+    try:
+        data = load_accounts_data()
+        for acct in data.get("accounts", []):
+            if acct.get("email") == email:
+                return acct.get("projectId")
+    except Exception:
+        pass
+    return None
 
 
 # ── Model Mapping ─────────────────────────────────────────────
