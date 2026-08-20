@@ -597,9 +597,10 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                     err_text = he.read().decode("utf-8", errors="ignore")
 
                     if status_code == 400:
-                        # Dump failed request for debugging
+                        # Dump full failed request for debugging
                         import datetime
                         debug_path = os.path.expanduser("~/.hermes/logs/antigravity-400-debug.json")
+                        full_debug_path = os.path.expanduser("~/.hermes/logs/antigravity-400-full.json")
                         try:
                             with open(debug_path, "w") as df:
                                 json.dump({
@@ -613,6 +614,9 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                                     "first_3_contents": gemini_body.get("contents", [])[:3],
                                     "last_3_contents": gemini_body.get("contents", [])[-3:],
                                 }, df, indent=2, default=str)
+                            # Also dump full request for deep debugging
+                            with open(full_debug_path, "w") as ff:
+                                json.dump(req_dict, ff, indent=2, default=str)
                         except Exception:
                             pass
 
