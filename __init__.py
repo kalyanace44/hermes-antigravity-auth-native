@@ -179,17 +179,37 @@ def get_auth_credentials(account):
         if project_id:
             _save_project_to_account(email, project_id)
 
-    # If we have a token but no project, try stored project first, then API
+    # If we have a token but no project, try stored project first, then API, then fallback
     if token and not project_id:
         project_id = _load_project_from_account(email)
         if not project_id:
             project_id = load_project_id(token)
+        if not project_id:
+            # Fallback: use a workspace project ID from AGY CLI cache if available
+            project_id = _load_fallback_project_id()
         if project_id:
             with _cache_lock:
                 _project_cache[email] = project_id
             _save_project_to_account(email, project_id)
 
     return token, project_id
+
+
+def _load_fallback_project_id():
+    """Try to load a workspace project ID from AGY CLI's cache."""
+    try:
+        cache_path = os.path.expanduser("~/.gemini/antigravity-cli/cache/projects.json")
+        if os.path.exists(cache_path):
+            with open(cache_path) as f:
+                projects = json.load(f)
+            # Use any available project ID
+            if projects:
+                pid = next(iter(projects.values()))
+                logger.info(f"[Antigravity] Using fallback project from AGY cache: {pid}")
+                return pid
+    except Exception:
+        pass
+    return None
 
 
 def _save_project_to_account(email, project_id):
@@ -630,6 +650,13 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         family = "claude" if is_claude else "gemini"
         mapped_model = resolve_internal_model(req_model)
         stream = req_json.get("stream", False)
+
+        # Use per-family active index if available
+        family_indices = data.get("activeIndexByFamily", {})
+        if family in family_indices:
+            family_idx = family_indices[family]
+            if 0 <= family_idx < len(accounts):
+                active_idx = family_idx
 
         # Build Gemini request
         gemini_contents, system_instruction = translate_openai_to_gemini(req_json.get("messages", []))
