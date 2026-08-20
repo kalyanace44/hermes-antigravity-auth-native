@@ -440,7 +440,9 @@ def translate_openai_to_gemini(messages):
                         _degraded_call_ids.add(call_id)
 
         if not parts:
-            parts = [{"text": " "}]
+            # Skip empty messages entirely — Claude rejects whitespace-only text blocks
+            # This happens when all tool_calls were dropped (no signature)
+            continue
         contents.append({"role": role, "parts": parts})
 
     # Merge consecutive same-role turns
