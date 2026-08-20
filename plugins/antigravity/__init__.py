@@ -636,7 +636,8 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                         with _cache_lock:
                             failures = _consecutive_failures.get(cooldown_key, 0) + 1
                             _consecutive_failures[cooldown_key] = failures
-                            cooldown_duration = {1: 60, 2: 300, 3: 1800}.get(failures, 7200)
+                            # Short cooldown for first failure (10s), escalate on repeated
+                            cooldown_duration = {1: 10, 2: 30, 3: 120}.get(failures, 300)
                             _cooldown_cache[cooldown_key] = time.time() + cooldown_duration
                             _token_cache.pop(email, None)
                             _project_cache.pop(email, None)
