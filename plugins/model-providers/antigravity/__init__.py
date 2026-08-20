@@ -8,6 +8,9 @@ BASE_URL = "http://127.0.0.1:8999/v1"
 API_KEY = "mock"
 
 MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.6-flash-low",
+    "gemini-3.6-flash-high",
     "gemini-3.7-flash",
     "claude-sonnet-4-6",
     "claude-opus-4-6",

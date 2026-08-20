@@ -239,6 +239,12 @@ def _load_project_from_account(email):
 
 # ── Model Mapping ─────────────────────────────────────────────
 MODEL_MAPPING = {
+    # Gemini 3.6 flash (confirmed working: low/medium/high tiers exist)
+    "gemini-3.6-flash": "gemini-3.6-flash-medium",    # default to medium
+    "gemini-3.6-flash-low": "gemini-3.6-flash-low",
+    "gemini-3.6-flash-medium": "gemini-3.6-flash-medium",
+    "gemini-3.6-flash-high": "gemini-3.6-flash-high",
+    "gemini-3.6-flash-thinking": "gemini-3.6-flash-high",
     # Gemini 3.7 / 3.5
     "gemini-3.7-flash": "gemini-3.5-flash-low",
     "gemini-3.7-flash-thinking": "gemini-3.5-flash-low",
@@ -268,6 +274,9 @@ MODEL_MAPPING = {
 }
 
 DISPLAY_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.6-flash-low",
+    "gemini-3.6-flash-high",
     "gemini-3.7-flash",
     "claude-sonnet-4-6",
     "claude-opus-4-6",
@@ -284,6 +293,8 @@ def resolve_internal_model(model_name):
         return MODEL_MAPPING[m]
     # Fuzzy fallback
     clean = m.replace("-medium", "").replace("-high", "").replace("-low", "").replace("-thinking", "")
+    if "3.6-flash" in clean:
+        return "gemini-3.6-flash-medium"
     if "3.7-flash" in clean or "3.5-flash" in clean:
         return "gemini-3.5-flash-low"
     if "3.1-pro" in clean or "3-pro" in clean:
@@ -692,12 +703,17 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         mapped_model = resolve_internal_model(req_model)
         stream = req_json.get("stream", False)
 
-        # Use per-family active index if available
+        # Use per-family active index if available, but ONLY if that account is enabled.
+        # Bug: activeIndexByFamily can be stale (e.g. pointing at a disabled account after
+        # the user disables one). Fall back to the global activeIndex in that case.
         family_indices = data.get("activeIndexByFamily", {})
         if family in family_indices:
             family_idx = family_indices[family]
             if 0 <= family_idx < len(accounts):
-                active_idx = family_idx
+                candidate = accounts[family_idx]
+                if candidate.get("enabled", True):
+                    active_idx = family_idx
+                # else: family_idx points to a disabled account — keep global activeIndex
 
         # Build Gemini request
         gemini_contents, system_instruction = translate_openai_to_gemini(req_json.get("messages", []))
@@ -733,6 +749,12 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             email = account.get("email", "")
 
             if not account.get("enabled", True):
+                continue
+
+            # Per-family opt-in: if account has enabledFamilies list, only use for those families.
+            # e.g. {"enabledFamilies": ["gemini"]} means skip this account for Claude requests.
+            enabled_families = account.get("enabledFamilies")
+            if enabled_families is not None and family not in enabled_families:
                 continue
 
             cooldown_key = f"{email}:{family}"
@@ -786,6 +808,10 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
 
                     if idx != active_idx:
                         data["activeIndex"] = idx
+                        # Also keep activeIndexByFamily in sync so future requests
+                        # for this family don't start from the stale (possibly disabled) index.
+                        family_indices_save = data.setdefault("activeIndexByFamily", {})
+                        family_indices_save[family] = idx
                         save_accounts_data(data)
                     break
 
@@ -1004,18 +1030,34 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                 if tool_calls:
                     delta["tool_calls"] = tool_calls
 
-                if delta or finish_reason:
+                # Always emit if there's content OR a finish signal.
+                # Critical: finish_reason can arrive in a final SSE event with
+                # no text/tool_calls (delta={}). We must still emit it so Hermes
+                # gets the stop signal — otherwise it retries the same tool call
+                # in an infinite loop.
+                if delta:
                     chunk = {
                         "id": f"chatcmpl-{int(time.time()*1000)}",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": req_model,
-                        "choices": [{"delta": delta, "index": 0, "finish_reason": finish_reason}]
+                        "choices": [{"delta": delta, "index": 0, "finish_reason": None}]
                     }
                     self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
                     self.wfile.flush()
 
                 if finish_reason:
+                    # Emit the finish chunk separately with empty delta so the
+                    # finish_reason is never accidentally skipped.
+                    fin_chunk = {
+                        "id": f"chatcmpl-{int(time.time()*1000)}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req_model,
+                        "choices": [{"delta": {}, "index": 0, "finish_reason": finish_reason}]
+                    }
+                    self.wfile.write(f"data: {json.dumps(fin_chunk)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
                     break
         except Exception:
             pass
