@@ -917,15 +917,26 @@ def perform_oauth_flow():
     global _auth_code, _oauth_server
     _auth_code = None
 
-    socketserver.TCPServer.allow_reuse_address = True
-    _oauth_server = socketserver.TCPServer(("127.0.0.1", 51121), _OAuthCallbackHandler)
+    # Try primary port, fall back to alternatives if busy
+    oauth_port = None
+    for port in [51121, 51122, 51123, 51124]:
+        try:
+            socketserver.TCPServer.allow_reuse_address = True
+            _oauth_server = socketserver.TCPServer(("127.0.0.1", port), _OAuthCallbackHandler)
+            oauth_port = port
+            break
+        except OSError:
+            continue
+
+    if oauth_port is None:
+        return False, "❌ All OAuth callback ports (51121-51124) are in use. Wait a moment and try again."
 
     t = threading.Thread(target=_oauth_server.serve_forever)
     t.start()
 
     params = {
         "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": f"http://localhost:{oauth_port}/oauth-callback",
         "response_type": "code",
         "scope": SCOPES,
         "access_type": "offline",
@@ -944,7 +955,7 @@ def perform_oauth_flow():
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "code": _auth_code,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": f"http://localhost:{oauth_port}/oauth-callback",
         "grant_type": "authorization_code"
     }).encode("utf-8")
 
