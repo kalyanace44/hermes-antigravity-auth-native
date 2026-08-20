@@ -523,6 +523,55 @@ def translate_openai_to_gemini(messages):
         else:
             merged.append(item)
 
+    # Drop orphaned functionResponses (no matching functionCall earlier)
+    # Collect all functionCall IDs present in the conversation
+    func_call_ids = set()
+    for item in merged:
+        for p in item.get("parts", []):
+            if "functionCall" in p:
+                fc = p["functionCall"]
+                fid = fc.get("id") or fc.get("name")
+                if fid:
+                    func_call_ids.add(fid)
+
+    # Remove content entries that are ONLY orphaned functionResponses
+    cleaned = []
+    for item in merged:
+        parts = item.get("parts", [])
+        # Filter out orphaned functionResponse parts
+        new_parts = []
+        for p in parts:
+            if "functionResponse" in p:
+                fr = p["functionResponse"]
+                fid = fr.get("id") or fr.get("name")
+                if fid not in func_call_ids and fid != "tool_result":
+                    continue  # orphaned — drop
+                # Also drop generic "tool_result" if no functionCalls exist at all
+                if fid == "tool_result" and not func_call_ids:
+                    continue
+            new_parts.append(p)
+        if new_parts:
+            item["parts"] = new_parts
+            cleaned.append(item)
+    merged = cleaned
+
+    # After dropping, re-merge consecutive same-role (text-only) turns
+    final = []
+    for item in merged:
+        if final and final[-1]["role"] == item["role"]:
+            # Safe to merge now — orphaned funcResp already removed
+            has_func = any("functionResponse" in p or "functionCall" in p for p in item["parts"])
+            prev_func = any("functionResponse" in p or "functionCall" in p for p in final[-1]["parts"])
+            if not has_func and not prev_func:
+                final[-1]["parts"].extend(item["parts"])
+            else:
+                # Insert dummy model turn to maintain alternation
+                final.append({"role": "model", "parts": [{"text": "Understood."}]})
+                final.append(item)
+        else:
+            final.append(item)
+    merged = final
+
     # Gemini requires first turn to be 'user'
     if merged and merged[0]["role"] == "model":
         merged.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
