@@ -394,7 +394,7 @@ def translate_openai_to_gemini(messages):
                         if isinstance(p, dict):
                             if p.get("type") == "text":
                                 t = p.get("text", "")
-                                if t:
+                                if t and t.strip():
                                     parts.append({"text": t})
                             elif p.get("type") == "image_url":
                                 img_obj = p.get("image_url", {})
@@ -408,7 +408,7 @@ def translate_openai_to_gemini(messages):
                                         pass
                         elif isinstance(p, str) and p:
                             parts.append({"text": p})
-                elif isinstance(content, str) and content:
+                elif isinstance(content, str) and content.strip():
                     if raw_role in ("system", "developer"):
                         parts.append({"text": f"[System Instructions]:\n{content}"})
                     else:
