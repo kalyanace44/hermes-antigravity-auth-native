@@ -622,6 +622,47 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path in ("/v1/quota", "/quota"):
+            data = load_accounts_data()
+            accounts = data.get("accounts", [])
+            now = time.time()
+            results = []
+            for acct in accounts:
+                email = acct.get("email", "")
+                enabled = acct.get("enabled", True)
+                for family in ("gemini", "claude"):
+                    cooldown_key = f"{email}:{family}"
+                    with _cache_lock:
+                        rc = _request_counts.get(cooldown_key, {"count": 0, "window_start": now})
+                        limit = _quota_limits.get(cooldown_key, 1000)
+                        cooldown_until = _cooldown_cache.get(cooldown_key, 0)
+                        reset_at = _quota_reset_at.get(cooldown_key, 0)
+                    
+                    reset_in_sec = 0
+                    if cooldown_until > now:
+                        reset_in_sec = int(cooldown_until - now)
+                    elif reset_at > now:
+                        reset_in_sec = int(reset_at - now)
+                        
+                    used = rc.get("count", 0)
+                    pct_remaining = max(0.0, min(100.0, 100.0 * (limit - used) / limit)) if limit > 0 else 100.0
+                    results.append({
+                        "email": email,
+                        "family": family,
+                        "enabled": enabled,
+                        "used": used,
+                        "limit": limit,
+                        "percent_remaining": pct_remaining,
+                        "reset_in_sec": reset_in_sec,
+                        "cooldown": cooldown_until > now
+                    })
+            body = json.dumps({"accounts": results}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(404)
         self.end_headers()
 
@@ -829,16 +870,8 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             self._error_response(500, f"All accounts failed. Last error: {last_err}")
             return
 
-        # ── Check quota warning (90% threshold) ──────────────────
+        # ── Quota warning DISABLED (was spamming chat) ──────────────────
         quota_warning = None
-        with _cache_lock:
-            rc = _request_counts.get(cooldown_key)
-            limit = _quota_limits.get(cooldown_key, DEFAULT_QUOTA_PER_HOUR)
-            if rc:
-                usage_pct = rc["count"] / limit
-                if usage_pct >= QUOTA_WARN_THRESHOLD:
-                    remaining = limit - rc["count"]
-                    quota_warning = f"⚠️ Antigravity quota at {int(usage_pct * 100)}% ({rc['count']}/{limit} requests this hour). ~{remaining} requests remaining."
 
         # ── Handle response ───────────────────────────────────
         if stream:
