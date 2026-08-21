@@ -1042,6 +1042,80 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                     break
 
         if not success:
+            # If ALL accounts are in cooldown, wait for the shortest one and retry ONCE
+            # instead of hard-failing with HTTP 500.
+            with _cache_lock:
+                now = time.time()
+                shortest_wait = None
+                shortest_key = None
+                for offset in range(len(accounts)):
+                    idx2 = (active_idx + offset) % len(accounts)
+                    acct2 = accounts[idx2]
+                    if not acct2.get("enabled", True):
+                        continue
+                    ef2 = acct2.get("enabledFamilies")
+                    if ef2 is not None and family not in ef2:
+                        continue
+                    ck = f"{acct2.get('email', '')}:{family}"
+                    cu = _cooldown_cache.get(ck, 0)
+                    if cu > now:
+                        wait = cu - now
+                        if shortest_wait is None or wait < shortest_wait:
+                            shortest_wait = wait
+                            shortest_key = ck
+
+            if shortest_wait is not None and shortest_wait <= 30:
+                # Wait up to 30s for the shortest cooldown to expire, then clear it and retry
+                time.sleep(shortest_wait + 0.5)
+                with _cache_lock:
+                    _cooldown_cache.pop(shortest_key, None)
+                    _consecutive_failures.pop(shortest_key, None)
+
+                # Single retry pass after waiting
+                for offset in range(len(accounts)):
+                    idx = (active_idx + offset) % len(accounts)
+                    account = accounts[idx]
+                    email = account.get("email", "")
+                    if not account.get("enabled", True):
+                        continue
+                    enabled_families = account.get("enabledFamilies")
+                    if enabled_families is not None and family not in enabled_families:
+                        continue
+                    cooldown_key = f"{email}:{family}"
+                    with _cache_lock:
+                        cooldown_until = _cooldown_cache.get(cooldown_key, 0)
+                    if time.time() < cooldown_until:
+                        continue
+                    try:
+                        token, project_id = get_auth_credentials(account)
+                    except Exception:
+                        continue
+                    action = "streamGenerateContent" if stream else "generateContent"
+                    url = f"{ENDPOINT}/v1internal:{action}"
+                    if stream:
+                        url += "?alt=sse"
+                    req_dict = {"model": mapped_model, "request": gemini_body}
+                    if project_id:
+                        req_dict["project"] = project_id
+                    headers = {
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "antigravity/windows/amd64",
+                        "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+                        "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}'
+                    }
+                    try:
+                        http_req = urllib.request.Request(url, data=json.dumps(req_dict).encode("utf-8"), headers=headers)
+                        resp = urllib.request.urlopen(http_req, timeout=120)
+                        success = True
+                        with _cache_lock:
+                            _consecutive_failures[cooldown_key] = 0
+                        break
+                    except Exception as e:
+                        last_err = f"Retry after cooldown wait failed on {email}: {e}"
+                        break
+
+        if not success:
             self._error_response(500, f"All accounts failed. Last error: {last_err}")
             return
 
