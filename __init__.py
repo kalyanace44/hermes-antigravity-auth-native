@@ -115,6 +115,121 @@ def refresh_token(ref_token):
         return json.loads(resp.read().decode("utf-8"))["access_token"]
 
 
+def fetch_account_usage(account: dict) -> dict:
+    """Fetch live plan/tier & quota metrics via Google Cloud Code loadCodeAssist API."""
+    email = account.get("email", "")
+    ref_tok = account.get("refreshToken", "")
+    tier = "PRO"
+
+    if ref_tok:
+        try:
+            tok = refresh_token(ref_tok)
+            url = f"{ENDPOINT}/v1internal:loadCodeAssist"
+            body = json.dumps({
+                "metadata": {
+                    "ideType": "ANTIGRAVITY",
+                    "platform": "PLATFORM_UNSPECIFIED",
+                    "pluginType": "GEMINI"
+                }
+            }).encode("utf-8")
+            headers = {
+                "Authorization": f"Bearer {tok}",
+                "Content-Type": "application/json",
+                "User-Agent": "google-api-nodejs-client/9.15.1",
+                "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+                "Client-Metadata": json.dumps({"ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"})
+            }
+            req = urllib.request.Request(url, data=body, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                allowed = data.get("allowedTiers", [])
+                if allowed:
+                    tier_name = allowed[0].get("name", "Gemini Code Assist")
+                    tier_id = allowed[0].get("id", "standard-tier")
+                    if "pro" in tier_name.lower() or "standard" in tier_id.lower():
+                        tier = "PRO"
+                    elif "free" in tier_id.lower():
+                        tier = "FREE"
+                    else:
+                        tier = tier_name
+        except Exception as e:
+            logger.warning(f"[Antigravity] fetch_account_usage tier lookup error for {email}: {e}")
+
+    now = time.time()
+    family_stats = {}
+    for family in ("gemini", "claude"):
+        cooldown_key = f"{email}:{family}"
+        with _cache_lock:
+            rc = _request_counts.get(cooldown_key, {"count": 0, "window_start": now})
+            limit = _quota_limits.get(cooldown_key, 1000)
+            cooldown_until = _cooldown_cache.get(cooldown_key, 0)
+            reset_at = _quota_reset_at.get(cooldown_key, 0)
+
+        reset_in_sec = 0
+        if cooldown_until > now:
+            reset_in_sec = int(cooldown_until - now)
+        elif reset_at > now:
+            reset_in_sec = int(reset_at - now)
+
+        used = rc.get("count", 0)
+        pct_remaining = max(0.0, min(100.0, 100.0 * (limit - used) / limit)) if limit > 0 else 100.0
+
+        family_stats[family] = {
+            "used": used,
+            "limit": limit,
+            "remaining": max(0, limit - used),
+            "percent_remaining": round(pct_remaining, 1),
+            "reset_in_sec": reset_in_sec,
+            "cooldown": cooldown_until > now
+        }
+
+    return {
+        "email": email,
+        "tier": tier,
+        "families": family_stats
+    }
+
+
+def handle_antigravity_usage(args=""):
+    """Handler for /antigravity-usage slash command."""
+    data = load_accounts_data()
+    accounts = data.get("accounts", [])
+    if not accounts:
+        return "No accounts configured. Use `/antigravity-login` to authenticate."
+
+    lines = ["📊 **Antigravity Usage & Quotas**\n"]
+    for acct in accounts:
+        usage = fetch_account_usage(acct)
+        email = usage["email"]
+        tier = usage["tier"]
+        enabled = "✅" if acct.get("enabled", True) else "❌"
+
+        lines.append(f"**Account:** `{email}` (Tier: **{tier}**) {enabled}")
+        for fam, stats in usage["families"].items():
+            pct = stats["percent_remaining"]
+            used = stats["used"]
+            limit = stats["limit"]
+            rem = stats["remaining"]
+            reset_sec = stats["reset_in_sec"]
+
+            filled = min(10, max(0, int(round(pct / 10.0))))
+            bar = "█" * filled + "░" * (10 - filled)
+
+            reset_info = ""
+            if reset_sec > 0:
+                h = reset_sec // 3600
+                m = (reset_sec % 3600) // 60
+                reset_str = f"{h}h {m}m" if h > 0 else f"{m}m"
+                reset_info = f" (Resets in {reset_str})"
+
+            fam_name = "Gemini Models" if fam == "gemini" else "Claude / GPT Models"
+            lines.append(f"  • {fam_name:<20}: `[{bar}]` **{pct:.1f}%** remaining ({rem}/{limit} requests){reset_info}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 def load_project_id(access_token):
     """Load the cloud project ID for code assist."""
     url = f"{ENDPOINT}/v1internal:loadCodeAssist"
@@ -239,42 +354,45 @@ def _load_project_from_account(email):
 
 # ── Model Mapping ─────────────────────────────────────────────
 MODEL_MAPPING = {
-    # Gemini 3.7 / 3.5
-    "gemini-3.7-flash": "gemini-3.5-flash-low",
-    "gemini-3.7-flash-thinking": "gemini-3.5-flash-low",
-    "gemini-3.7-flash-medium": "gemini-3.5-flash-low",
-    "gemini-3.7-flash-high": "gemini-3.5-flash-low",
-    "gemini-3.7-flash-low": "gemini-3.5-flash-low",
-    "gemini-3.5-flash": "gemini-3.5-flash-low",
-    "gemini-3.5-flash-low": "gemini-3.5-flash-low",
-    # Gemini 3.1 / 3 / 2.5
-    "gemini-3.1-pro": "gemini-3.1-pro-low",
-    "gemini-3.1-pro-medium": "gemini-3.1-pro-low",
-    "gemini-3.1-pro-high": "gemini-3.1-pro-low",
-    "gemini-3.1-pro-low": "gemini-3.1-pro-low",
-    "gemini-3-flash": "gemini-3-flash",
-    "gemini-2.5-flash": "gemini-2.5-flash",
+    # Gemini 3.6 flash (confirmed working: low/medium/high tiers exist)
+    "gemini-3.6-flash": "gemini-3.6-flash-medium",    # default to medium
+    "gemini-3.6-flash-low": "gemini-3.6-flash-low",
+    "gemini-3.6-flash-medium": "gemini-3.6-flash-medium",
+    "gemini-3.6-flash-high": "gemini-3.6-flash-high",
+    "gemini-3.6-flash-thinking": "gemini-3.6-flash-high",
+    # Gemini 3.7 maps to 3.6
+    "gemini-3.7-flash": "gemini-3.6-flash-medium",
+    "gemini-3.7-flash-thinking": "gemini-3.6-flash-high",
+    "gemini-3.7-flash-medium": "gemini-3.6-flash-medium",
+    "gemini-3.7-flash-high": "gemini-3.6-flash-high",
+    "gemini-3.7-flash-low": "gemini-3.6-flash-low",
     # Claude Sonnet
     "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
     "claude-sonnet-4-6-thinking": "claude-sonnet-4-6",
     "claude-3-5-sonnet": "claude-sonnet-4-6",
+    "claude-3.5-sonnet": "claude-sonnet-4-6",
+    "claude-3.7-sonnet": "claude-sonnet-4-6",
+    "claude-3-7-sonnet": "claude-sonnet-4-6",
     # Claude Opus
-    "claude-opus-4-6": "claude-opus-4-6-thinking",
+    "claude-opus-4-6": "claude-opus-4-6",
+    "claude-opus-4.6": "claude-opus-4-6",
     "claude-opus-4-6-thinking": "claude-opus-4-6-thinking",
-    "claude-3-opus": "claude-opus-4-6-thinking",
+    "claude-3-opus": "claude-opus-4-6",
+    "claude-3.0-opus": "claude-opus-4-6",
     # GPT OSS
     "gpt-oss-120b": "gpt-oss-120b-medium",
     "gpt-oss-120b-medium": "gpt-oss-120b-medium",
 }
 
 DISPLAY_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.6-flash-low",
+    "gemini-3.6-flash-high",
     "gemini-3.7-flash",
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "gpt-oss-120b",
-    "gemini-3.1-pro",
-    "gemini-3-flash",
-    "gemini-2.5-flash",
 ]
 
 
@@ -284,21 +402,33 @@ def resolve_internal_model(model_name):
         return MODEL_MAPPING[m]
     # Fuzzy fallback
     clean = m.replace("-medium", "").replace("-high", "").replace("-low", "").replace("-thinking", "")
-    if "3.7-flash" in clean or "3.5-flash" in clean:
-        return "gemini-3.5-flash-low"
-    if "3.1-pro" in clean or "3-pro" in clean:
-        return "gemini-3.1-pro-low"
-    if "3-flash" in clean:
-        return "gemini-3-flash"
-    if "2.5-flash" in clean:
-        return "gemini-2.5-flash"
+    if "3.6-flash" in clean:
+        return "gemini-3.6-flash-medium"
+    if "3.7-flash" in clean:
+        return "gemini-3.6-flash-medium"
     if "sonnet" in clean:
         return "claude-sonnet-4-6"
     if "opus" in clean:
-        return "claude-opus-4-6-thinking"
+        return "claude-opus-4-6"
     if "gpt-oss" in clean:
         return "gpt-oss-120b-medium"
-    return "gemini-3.5-flash-low"
+    return "gemini-3.6-flash-medium"
+
+
+def get_model_fallbacks(internal_model):
+    """Return fallback model tiers for transient HTTP 503 capacity errors."""
+    m = internal_model.lower().strip()
+    if m == "gemini-3.6-flash-low":
+        return ["gemini-3.6-flash-medium", "gemini-3.6-flash-high"]
+    elif m == "gemini-3.6-flash-medium":
+        return ["gemini-3.6-flash-high", "gemini-3.6-flash-low"]
+    elif m == "gemini-3.6-flash-high":
+        return ["gemini-3.6-flash-medium", "gemini-3.6-flash-low"]
+    elif "sonnet" in m:
+        return ["claude-opus-4-6"]
+    elif "opus" in m:
+        return ["claude-sonnet-4-6"]
+    return []
 
 
 # ── Schema Cleaning (Gemini tool use) ─────────────────────────
@@ -436,14 +566,22 @@ def _compact_messages(messages):
     return result
 
 
-def translate_openai_to_gemini(messages):
+def translate_openai_to_gemini(messages, is_claude=False):
     # Apply compaction before translation
     messages = _compact_messages(messages)
 
+    # Pre-scan messages to map tool_call_id -> tool_name so functionResponse.name always matches functionCall.name
+    call_id_to_name = {}
+    for msg in messages:
+        if msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                cid = tc.get("id")
+                fname = tc.get("function", {}).get("name")
+                if cid and fname:
+                    call_id_to_name[cid] = fname
+
     contents = []
     system_parts = []  # Collect system/developer messages separately
-    # Track call_ids that were degraded to text (no thought signature)
-    _degraded_call_ids = set()
 
     for msg in messages:
         raw_role = msg.get("role", "user")
@@ -460,17 +598,22 @@ def translate_openai_to_gemini(messages):
 
         if raw_role == "tool":
             call_id = msg.get("tool_call_id") or f"call_{int(time.time()*1000)}"
-            if call_id in _degraded_call_ids:
-                # Matching call was degraded — skip result entirely
-                continue
+            tool_name = msg.get("name") or call_id_to_name.get(call_id) or "tool"
+            try:
+                resp_data = json.loads(content) if isinstance(content, str) else content
+            except Exception:
+                resp_data = {"result": content}
+            if not isinstance(resp_data, dict) or resp_data is None:
+                resp_data = {"result": resp_data}
+
+            with _sig_lock:
+                sig = _thought_signatures.get(call_id)
+            if not sig:
+                # If functionCall had no thought_signature and was degraded to text,
+                # convert matching tool result to text as well so Google API doesn't get orphaned functionResponse.
+                parts.append({"text": f"[Tool result ({tool_name}): {json.dumps(resp_data)}]"})
             else:
-                try:
-                    resp_data = json.loads(content) if isinstance(content, str) else content
-                except Exception:
-                    resp_data = {"result": content}
-                if not isinstance(resp_data, dict) or resp_data is None:
-                    resp_data = {"result": resp_data}
-                func_resp = {"name": msg.get("name") or "tool_result", "response": resp_data}
+                func_resp = {"name": tool_name, "response": resp_data}
                 if call_id:
                     func_resp["id"] = call_id
                 parts.append({"functionResponse": func_resp})
@@ -510,22 +653,18 @@ def translate_openai_to_gemini(messages):
                     func_call = {"name": name, "args": args}
                     if call_id:
                         func_call["id"] = call_id
-                    # Look up thought signature: ONLY trust in-memory cache
-                    # (from current session responses). DB-stored signatures become
-                    # invalid after account switch or restart — degrade to text.
+                    part_obj = {"functionCall": func_call}
                     with _sig_lock:
                         sig = _thought_signatures.get(call_id)
                     if sig:
-                        part_obj = {"functionCall": func_call, "thoughtSignature": sig}
-                        parts.append(part_obj)
+                        part_obj["thoughtSignature"] = sig
                     else:
-                        # No signature available (lost on restart) — skip entirely
-                        # Don't render as text — Gemini confuses it with its own output
-                        _degraded_call_ids.add(call_id)
+                        # For all models (Gemini & Claude), if thoughtSignature is missing, convert functionCall to text
+                        # to avoid HTTP 400 "missing thought_signature" error from Antigravity API.
+                        part_obj = {"text": f"[Tool call: {name}({json.dumps(args)})]"}
+                    parts.append(part_obj)
 
         if not parts:
-            # Skip empty messages entirely — Claude rejects whitespace-only text blocks
-            # This happens when all tool_calls were dropped (no signature)
             continue
         contents.append({"role": role, "parts": parts})
 
@@ -603,6 +742,17 @@ def translate_openai_to_gemini(messages):
     # Claude via Antigravity rejects assistant prefill — last turn must be 'user'
     if merged and merged[-1]["role"] == "model":
         merged = merged[:-1]  # Drop trailing model message (it's stale/incomplete anyway)
+
+    # FINAL SAFETY GUARANTEE FOR ALL MODELS (Gemini, Claude, GPT-OSS):
+    # Scan all turns. If any part contains "functionCall" without a valid thoughtSignature,
+    # convert it to text to prevent HTTP 400 "missing thought_signature" errors from Antigravity API.
+    for item in merged:
+        for i, p in enumerate(item.get("parts", [])):
+            if "functionCall" in p and not p.get("thoughtSignature"):
+                fc = p["functionCall"]
+                fname = fc.get("name", "tool")
+                fargs = fc.get("args", {})
+                item["parts"][i] = {"text": f"[Tool call: {fname}({json.dumps(fargs)})]"}
 
     return merged, system_parts
 
@@ -692,15 +842,20 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         mapped_model = resolve_internal_model(req_model)
         stream = req_json.get("stream", False)
 
-        # Use per-family active index if available
+        # Use per-family active index if available, but ONLY if that account is enabled.
+        # Bug: activeIndexByFamily can be stale (e.g. pointing at a disabled account after
+        # the user disables one). Fall back to the global activeIndex in that case.
         family_indices = data.get("activeIndexByFamily", {})
         if family in family_indices:
             family_idx = family_indices[family]
             if 0 <= family_idx < len(accounts):
-                active_idx = family_idx
+                candidate = accounts[family_idx]
+                if candidate.get("enabled", True):
+                    active_idx = family_idx
+                # else: family_idx points to a disabled account — keep global activeIndex
 
         # Build Gemini request
-        gemini_contents, system_instruction = translate_openai_to_gemini(req_json.get("messages", []))
+        gemini_contents, system_instruction = translate_openai_to_gemini(req_json.get("messages", []), is_claude=is_claude)
         gemini_tools = translate_openai_tools_to_gemini(req_json.get("tools"))
 
         gen_config = {}
@@ -712,9 +867,10 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
 
         max_toks = req_json.get("max_tokens") or req_json.get("max_completion_tokens")
         if max_toks is not None:
-            gen_config["maxOutputTokens"] = max(int(max_toks), MIN_OUTPUT_TOKENS)
+            # Always allow up to 64000 maxOutputTokens so thinking models do not truncate
+            gen_config["maxOutputTokens"] = min(max(int(max_toks), 64000), 64000)
         else:
-            gen_config["maxOutputTokens"] = MIN_OUTPUT_TOKENS
+            gen_config["maxOutputTokens"] = 64000
 
         gemini_body = {"contents": gemini_contents, "generationConfig": gen_config}
         if system_instruction:
@@ -733,6 +889,12 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             email = account.get("email", "")
 
             if not account.get("enabled", True):
+                continue
+
+            # Per-family opt-in: if account has enabledFamilies list, only use for those families.
+            # e.g. {"enabledFamilies": ["gemini"]} means skip this account for Claude requests.
+            enabled_families = account.get("enabledFamilies")
+            if enabled_families is not None and family not in enabled_families:
                 continue
 
             cooldown_key = f"{email}:{family}"
@@ -754,117 +916,130 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             if stream:
                 url += "?alt=sse"
 
-            req_dict = {"model": mapped_model, "request": gemini_body}
-            if project_id:
-                req_dict["project"] = project_id
+            models_to_try = [mapped_model] + get_model_fallbacks(mapped_model)
+            for current_model in models_to_try:
+                req_dict = {"model": current_model, "request": gemini_body}
+                if project_id:
+                    req_dict["project"] = project_id
 
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "User-Agent": "antigravity/windows/amd64",
-                "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-                "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}'
-            }
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "antigravity/windows/amd64",
+                    "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+                    "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}'
+                }
 
-            # Retry transient network errors (SSL EOF, connection reset, timeout)
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    http_req = urllib.request.Request(url, data=json.dumps(req_dict).encode("utf-8"), headers=headers)
-                    resp = urllib.request.urlopen(http_req, timeout=120)
-                    success = True
+                # Retry transient network errors (SSL EOF, connection reset, timeout) and 503 capacity
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        http_req = urllib.request.Request(url, data=json.dumps(req_dict).encode("utf-8"), headers=headers)
+                        resp = urllib.request.urlopen(http_req, timeout=120)
+                        success = True
 
-                    with _cache_lock:
-                        _consecutive_failures[cooldown_key] = 0
-                        # Track request count for quota warnings
-                        now = time.time()
-                        rc = _request_counts.get(cooldown_key)
-                        if not rc or (now - rc["window_start"]) > 3600:
-                            _request_counts[cooldown_key] = {"count": 1, "window_start": now}
-                        else:
-                            rc["count"] += 1
-
-                    if idx != active_idx:
-                        data["activeIndex"] = idx
-                        save_accounts_data(data)
-                    break
-
-                except urllib.error.HTTPError as he:
-                    status_code = he.code
-                    err_text = he.read().decode("utf-8", errors="ignore")
-
-                    if status_code == 400:
-                        # Dump full failed request for debugging
-                        import datetime
-                        debug_path = os.path.expanduser("~/.hermes/logs/antigravity-400-debug.json")
-                        full_debug_path = os.path.expanduser("~/.hermes/logs/antigravity-400-full.json")
-                        try:
-                            with open(debug_path, "w") as df:
-                                json.dump({
-                                    "timestamp": datetime.datetime.now().isoformat(),
-                                    "model": mapped_model,
-                                    "email": email,
-                                    "error": err_text[:500],
-                                    "num_contents": len(gemini_body.get("contents", [])),
-                                    "num_tools": len(gemini_body.get("tools", [])) if gemini_body.get("tools") else 0,
-                                    "request_size_bytes": len(json.dumps(req_dict)),
-                                    "first_3_contents": gemini_body.get("contents", [])[:3],
-                                    "last_3_contents": gemini_body.get("contents", [])[-3:],
-                                }, df, indent=2, default=str)
-                            # Also dump full request for deep debugging
-                            with open(full_debug_path, "w") as ff:
-                                json.dump(req_dict, ff, indent=2, default=str)
-                        except Exception:
-                            pass
-
-                    if status_code == 429:
-                        # Parse reset time from error message
-                        reset_match = re.search(r"Resets in (\d+)h(\d+)m(\d+)s", err_text)
-                        reset_secs = 3600  # default 1h
-                        if reset_match:
-                            h, m, s = int(reset_match.group(1)), int(reset_match.group(2)), int(reset_match.group(3))
-                            reset_secs = h * 3600 + m * 60 + s
                         with _cache_lock:
-                            # Learn the quota limit from current count
+                            _consecutive_failures[cooldown_key] = 0
+                            # Track request count for quota warnings
+                            now = time.time()
                             rc = _request_counts.get(cooldown_key)
-                            if rc and rc["count"] > 0:
-                                _quota_limits[cooldown_key] = rc["count"]
-                            _quota_reset_at[cooldown_key] = time.time() + reset_secs
-                        _save_quota_limits()
-                        last_err = f"⚠️ QUOTA EXHAUSTED on {email} ({family}). Resets in {reset_secs // 60}m. Error: {err_text[:150]}"
-                    else:
-                        last_err = f"HTTP {status_code} on {email}: {err_text[:200]}"
+                            if not rc or (now - rc["window_start"]) > 3600:
+                                _request_counts[cooldown_key] = {"count": 1, "window_start": now}
+                            else:
+                                rc["count"] += 1
 
-                    if status_code in (429, 403, 503):
-                        with _cache_lock:
-                            failures = _consecutive_failures.get(cooldown_key, 0) + 1
-                            _consecutive_failures[cooldown_key] = failures
-                            # Short cooldown for first failure (10s), escalate on repeated
-                            cooldown_duration = {1: 10, 2: 30, 3: 120}.get(failures, 300)
-                            _cooldown_cache[cooldown_key] = time.time() + cooldown_duration
-                            _token_cache.pop(email, None)
-                            _project_cache.pop(email, None)
+                        if idx != active_idx:
+                            data["activeIndex"] = idx
+                            # Also keep activeIndexByFamily in sync so future requests
+                            # for this family don't start from the stale (possibly disabled) index.
+                            family_indices_save = data.setdefault("activeIndexByFamily", {})
+                            family_indices_save[family] = idx
+                            save_accounts_data(data)
+                        break
 
-                    if status_code == 401:
-                        with _cache_lock:
-                            _token_cache.pop(email, None)
-                            _project_cache.pop(email, None)
+                    except urllib.error.HTTPError as he:
+                        status_code = he.code
+                        err_text = he.read().decode("utf-8", errors="ignore")
 
-                    break  # HTTP errors are not retryable (except via account rotation)
+                        if status_code == 503:
+                            last_err = f"HTTP 503 (Capacity) on {email} for {current_model}: {err_text[:150]}"
+                            if attempt < max_retries - 1:
+                                time.sleep(1.5 * (attempt + 1))
+                                continue
+                            break  # Try fallback model tier
 
-                except Exception as e:
-                    last_err = f"Request error on {email}: {e}"
-                    is_transient = any(s in str(e) for s in [
-                        "SSL", "EOF", "Connection reset", "timed out",
-                        "Connection refused", "Temporary failure"
-                    ])
-                    if is_transient and attempt < max_retries - 1:
-                        time.sleep(1 * (attempt + 1))  # 1s, 2s backoff
-                        continue
+                        if status_code == 400:
+                            # Dump full failed request for debugging
+                            import datetime
+                            debug_path = os.path.expanduser("~/.hermes/logs/antigravity-400-debug.json")
+                            full_debug_path = os.path.expanduser("~/.hermes/logs/antigravity-400-full.json")
+                            try:
+                                with open(debug_path, "w") as df:
+                                    json.dump({
+                                        "timestamp": datetime.datetime.now().isoformat(),
+                                        "model": current_model,
+                                        "email": email,
+                                        "error": err_text[:500],
+                                        "num_contents": len(gemini_body.get("contents", [])),
+                                        "num_tools": len(gemini_body.get("tools", [])) if gemini_body.get("tools") else 0,
+                                        "request_size_bytes": len(json.dumps(req_dict)),
+                                        "first_3_contents": gemini_body.get("contents", [])[:3],
+                                        "last_3_contents": gemini_body.get("contents", [])[-3:],
+                                    }, df, indent=2, default=str)
+                                # Also dump full request for deep debugging
+                                with open(full_debug_path, "w") as ff:
+                                    json.dump(req_dict, ff, indent=2, default=str)
+                            except Exception:
+                                pass
+
+                        if status_code == 429:
+                            # Parse reset time from error message
+                            reset_match = re.search(r"Resets in (\d+)h(\d+)m(\d+)s", err_text)
+                            reset_secs = 3600  # default 1h
+                            if reset_match:
+                                h, m, s = int(reset_match.group(1)), int(reset_match.group(2)), int(reset_match.group(3))
+                                reset_secs = h * 3600 + m * 60 + s
+                            with _cache_lock:
+                                # Learn the quota limit from current count
+                                rc = _request_counts.get(cooldown_key)
+                                if rc and rc["count"] > 0:
+                                    _quota_limits[cooldown_key] = rc["count"]
+                                _quota_reset_at[cooldown_key] = time.time() + reset_secs
+                            _save_quota_limits()
+                            last_err = f"⚠️ QUOTA EXHAUSTED on {email} ({family}). Resets in {reset_secs // 60}m. Error: {err_text[:150]}"
+                        else:
+                            last_err = f"HTTP {status_code} on {email}: {err_text[:200]}"
+
+                        if status_code in (429, 403):
+                            with _cache_lock:
+                                failures = _consecutive_failures.get(cooldown_key, 0) + 1
+                                _consecutive_failures[cooldown_key] = failures
+                                # Short cooldown for first failure (10s), escalate on repeated
+                                cooldown_duration = {1: 10, 2: 30, 3: 120}.get(failures, 300)
+                                _cooldown_cache[cooldown_key] = time.time() + cooldown_duration
+                                _token_cache.pop(email, None)
+                                _project_cache.pop(email, None)
+
+                        if status_code == 401:
+                            with _cache_lock:
+                                _token_cache.pop(email, None)
+                                _project_cache.pop(email, None)
+
+                        break  # HTTP errors are not retryable (except via model fallback/account rotation)
+
+                    except Exception as e:
+                        last_err = f"Request error on {email}: {e}"
+                        is_transient = any(s in str(e) for s in [
+                            "SSL", "EOF", "Connection reset", "timed out",
+                            "Connection refused", "Temporary failure"
+                        ])
+                        if is_transient and attempt < max_retries - 1:
+                            time.sleep(1 * (attempt + 1))  # 1s, 2s backoff
+                            continue
+                        break
+
+                if success:
                     break
-
-            if success:
-                break
 
         if not success:
             self._error_response(500, f"All accounts failed. Last error: {last_err}")
@@ -947,6 +1122,9 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
+        stream_call_ids = {}      # idx -> call_id
+        emitted_call_keys = set() # (call_id, func_name, args_str)
+
         try:
             while True:
                 line_bytes = resp.readline()
@@ -973,26 +1151,41 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
 
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts", [])
+                    tool_idx = 0
                     for p in parts:
                         if "text" in p:
                             text += p["text"]
                         if "functionCall" in p:
                             fc = p["functionCall"]
-                            call_id = fc.get("id") or f"call_{int(time.time()*1000)}"
+                            if tool_idx not in stream_call_ids:
+                                stream_call_ids[tool_idx] = fc.get("id") or f"call_{int(time.time()*1000)}_{tool_idx}"
+                            call_id = stream_call_ids[tool_idx]
                             sig = p.get("thoughtSignature")
                             if sig:
                                 with _sig_lock:
                                     _thought_signatures[call_id] = sig
-                            tool_calls.append({
-                                "index": len(tool_calls),
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": fc.get("name", ""), "arguments": json.dumps(fc.get("args", {}))}
-                            })
+
+                            args_obj = fc.get("args", {})
+                            args_str = json.dumps(args_obj, sort_keys=True)
+                            call_key = (call_id, fc.get("name", ""), args_str)
+
+                            if call_key not in emitted_call_keys:
+                                emitted_call_keys.add(call_key)
+                                tool_calls.append({
+                                    "index": tool_idx,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": fc.get("name", ""), "arguments": json.dumps(args_obj)}
+                                })
+                            tool_idx += 1
 
                     raw_reason = candidates[0].get("finishReason")
-                    if tool_calls:
-                        finish_reason = "tool_calls"
+                    if tool_calls or emitted_call_keys:
+                        if raw_reason or candidates[0].get("content"):
+                            if raw_reason == "STOP" or raw_reason:
+                                finish_reason = "tool_calls"
+                    elif raw_reason == "MAX_TOKENS":
+                        finish_reason = "length"
                     elif raw_reason == "STOP":
                         finish_reason = "stop"
                     elif raw_reason:
@@ -1004,18 +1197,34 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                 if tool_calls:
                     delta["tool_calls"] = tool_calls
 
-                if delta or finish_reason:
+                # Always emit if there's content OR a finish signal.
+                # Critical: finish_reason can arrive in a final SSE event with
+                # no text/tool_calls (delta={}). We must still emit it so Hermes
+                # gets the stop signal — otherwise it retries the same tool call
+                # in an infinite loop.
+                if delta:
                     chunk = {
                         "id": f"chatcmpl-{int(time.time()*1000)}",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": req_model,
-                        "choices": [{"delta": delta, "index": 0, "finish_reason": finish_reason}]
+                        "choices": [{"delta": delta, "index": 0, "finish_reason": None}]
                     }
                     self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
                     self.wfile.flush()
 
                 if finish_reason:
+                    # Emit the finish chunk separately with empty delta so the
+                    # finish_reason is never accidentally skipped.
+                    fin_chunk = {
+                        "id": f"chatcmpl-{int(time.time()*1000)}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req_model,
+                        "choices": [{"delta": {}, "index": 0, "finish_reason": finish_reason}]
+                    }
+                    self.wfile.write(f"data: {json.dumps(fin_chunk)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
                     break
         except Exception:
             pass
@@ -1316,6 +1525,11 @@ def handle_antigravity_quota(args):
 
 
 def register(ctx):
+    ctx.register_command(
+        "antigravity-usage",
+        handler=handle_antigravity_usage,
+        description="Show live Antigravity quota & model usage from Google"
+    )
     ctx.register_command(
         "antigravity-login",
         handler=handle_antigravity_login,
