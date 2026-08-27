@@ -467,7 +467,8 @@ def get_model_fallbacks(internal_model):
 UNSUPPORTED_SCHEMA_FIELDS = {
     "additionalProperties", "$schema", "$id", "$comment", "$ref", "$defs",
     "definitions", "const", "anyOf", "oneOf", "patternProperties",
-    "unevaluatedProperties", "unevaluatedItems", "dependentRequired"
+    "unevaluatedProperties", "unevaluatedItems", "dependentRequired",
+    "default", "title", "examples", "example"
 }
 
 
@@ -903,11 +904,18 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
 
         max_toks = req_json.get("max_tokens") or req_json.get("max_completion_tokens")
         if max_toks is not None:
-            # Respect user's max_tokens but ensure at least 8192 for tool-use,
-            # and cap at 65536 (Gemini's maximum for most models)
-            gen_config["maxOutputTokens"] = min(max(int(max_toks), 8192), 65536)
+            # Respect user's max_tokens but ensure at least 8192 for tool-use.
+            # Cap at 8192 for flash-low, 16384 for flash-medium, 32768 for flash-high
+            resolved = resolve_model(req_model)
+            if "low" in resolved:
+                cap = 8192
+            elif "high" in resolved:
+                cap = 32768
+            else:
+                cap = 16384
+            gen_config["maxOutputTokens"] = min(max(int(max_toks), 4096), cap)
         else:
-            gen_config["maxOutputTokens"] = 32768
+            gen_config["maxOutputTokens"] = 8192
 
         gemini_body = {"contents": gemini_contents, "generationConfig": gen_config}
         if system_instruction:
