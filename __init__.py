@@ -904,7 +904,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         if max_toks is not None:
             # Respect user's max_tokens but ensure at least 8192 for tool-use.
             # Cap at 8192 for flash-low, 16384 for flash-medium, 32768 for flash-high
-            resolved = resolve_model(req_model)
+            resolved = resolve_internal_model(req_model)
             if "low" in resolved:
                 cap = 8192
             elif "high" in resolved:
