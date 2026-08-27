@@ -903,10 +903,11 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
 
         max_toks = req_json.get("max_tokens") or req_json.get("max_completion_tokens")
         if max_toks is not None:
-            # Always allow up to 64000 maxOutputTokens so thinking models do not truncate
-            gen_config["maxOutputTokens"] = min(max(int(max_toks), 64000), 64000)
+            # Respect user's max_tokens but ensure at least 8192 for tool-use,
+            # and cap at 65536 (Gemini's maximum for most models)
+            gen_config["maxOutputTokens"] = min(max(int(max_toks), 8192), 65536)
         else:
-            gen_config["maxOutputTokens"] = 64000
+            gen_config["maxOutputTokens"] = 32768
 
         gemini_body = {"contents": gemini_contents, "generationConfig": gen_config}
         if system_instruction:
