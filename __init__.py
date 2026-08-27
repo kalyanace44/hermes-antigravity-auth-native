@@ -646,13 +646,11 @@ def translate_openai_to_gemini(messages, is_claude=False):
                     parts.append({"text": f"Tool result for {tool_name}: {json.dumps(resp_data)}"})
                 else:
                     func_resp = {"name": tool_name, "response": resp_data}
-                    if call_id:
-                        func_resp["id"] = call_id
+                    # NOTE: Gemini API rejects 'id' on functionResponse — only functionCall takes 'id'
                     parts.append({"functionResponse": func_resp})
             else:
                 func_resp = {"name": tool_name, "response": resp_data}
-                if call_id:
-                    func_resp["id"] = call_id
+                # NOTE: Gemini API rejects 'id' on functionResponse — only functionCall takes 'id'
                 parts.append({"functionResponse": func_resp})
         else:
             if content is not None:
