@@ -774,8 +774,8 @@ def translate_openai_to_gemini(messages, is_claude=False):
         merged.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
 
     # Claude via Antigravity rejects assistant prefill — last turn must be 'user'
-    if merged and merged[-1]["role"] == "model":
-        merged = merged[:-1]  # Drop trailing model message (it's stale/incomplete anyway)
+    while merged and merged[-1]["role"] == "model":
+        merged = merged[:-1]  # Drop trailing model messages (Gemini requires last turn to be user)
 
     # FINAL SAFETY GUARANTEE FOR GEMINI MODELS:
     # Scan all turns. If any part contains "functionCall" without a valid thoughtSignature,
