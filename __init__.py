@@ -73,8 +73,40 @@ def _save_quota_limits():
         pass
 
 
-# Load learned limits on startup
+SIG_FILE = os.path.expanduser("~/.hermes/antigravity-signatures.json")
+
+
+def _load_thought_signatures():
+    """Load persisted thought signatures from disk (survives restart)."""
+    if os.path.exists(SIG_FILE):
+        try:
+            with open(SIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_thought_signatures():
+    """Persist thought signatures to disk."""
+    try:
+        data = {}
+        with _sig_lock:
+            if len(_thought_signatures) > 2000:
+                keys = list(_thought_signatures.keys())
+                for k in keys[:-1000]:
+                    _thought_signatures.pop(k, None)
+            data = dict(_thought_signatures)
+        os.makedirs(os.path.dirname(SIG_FILE), exist_ok=True)
+        with open(SIG_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+# Load learned limits and signatures on startup
 _quota_limits = _load_quota_limits()
+_thought_signatures = _load_thought_signatures()
 
 # ── Isolated Account Store ────────────────────────────────────
 def get_accounts_file_path():
@@ -606,12 +638,16 @@ def translate_openai_to_gemini(messages, is_claude=False):
             if not isinstance(resp_data, dict) or resp_data is None:
                 resp_data = {"result": resp_data}
 
-            with _sig_lock:
-                sig = _thought_signatures.get(call_id)
-            if not sig:
-                # If functionCall had no thought_signature and was degraded to text,
-                # convert matching tool result to text as well so Google API doesn't get orphaned functionResponse.
-                parts.append({"text": f"[Tool result ({tool_name}): {json.dumps(resp_data)}]"})
+            if not is_claude:
+                with _sig_lock:
+                    sig = _thought_signatures.get(call_id)
+                if not sig:
+                    parts.append({"text": f"Tool result for {tool_name}: {json.dumps(resp_data)}"})
+                else:
+                    func_resp = {"name": tool_name, "response": resp_data}
+                    if call_id:
+                        func_resp["id"] = call_id
+                    parts.append({"functionResponse": func_resp})
             else:
                 func_resp = {"name": tool_name, "response": resp_data}
                 if call_id:
@@ -654,14 +690,13 @@ def translate_openai_to_gemini(messages, is_claude=False):
                     if call_id:
                         func_call["id"] = call_id
                     part_obj = {"functionCall": func_call}
-                    with _sig_lock:
-                        sig = _thought_signatures.get(call_id)
-                    if sig:
-                        part_obj["thoughtSignature"] = sig
-                    else:
-                        # For all models (Gemini & Claude), if thoughtSignature is missing, convert functionCall to text
-                        # to avoid HTTP 400 "missing thought_signature" error from Antigravity API.
-                        part_obj = {"text": f"[Tool call: {name}({json.dumps(args)})]"}
+                    if not is_claude:
+                        with _sig_lock:
+                            sig = _thought_signatures.get(call_id)
+                        if sig:
+                            part_obj["thoughtSignature"] = sig
+                        else:
+                            part_obj = {"text": f"Executed tool {name} with arguments {json.dumps(args)}"}
                     parts.append(part_obj)
 
         if not parts:
@@ -743,16 +778,17 @@ def translate_openai_to_gemini(messages, is_claude=False):
     if merged and merged[-1]["role"] == "model":
         merged = merged[:-1]  # Drop trailing model message (it's stale/incomplete anyway)
 
-    # FINAL SAFETY GUARANTEE FOR ALL MODELS (Gemini, Claude, GPT-OSS):
+    # FINAL SAFETY GUARANTEE FOR GEMINI MODELS:
     # Scan all turns. If any part contains "functionCall" without a valid thoughtSignature,
-    # convert it to text to prevent HTTP 400 "missing thought_signature" errors from Antigravity API.
-    for item in merged:
-        for i, p in enumerate(item.get("parts", [])):
-            if "functionCall" in p and not p.get("thoughtSignature"):
-                fc = p["functionCall"]
-                fname = fc.get("name", "tool")
-                fargs = fc.get("args", {})
-                item["parts"][i] = {"text": f"[Tool call: {fname}({json.dumps(fargs)})]"}
+    # convert it to text ONLY for Gemini models (is_claude=False).
+    if not is_claude:
+        for item in merged:
+            for i, p in enumerate(item.get("parts", [])):
+                if "functionCall" in p and not p.get("thoughtSignature"):
+                    fc = p["functionCall"]
+                    fname = fc.get("name", "tool")
+                    fargs = fc.get("args", {})
+                    item["parts"][i] = {"text": f"Executed tool {fname} with arguments {json.dumps(fargs)}"}
 
     return merged, system_parts
 
@@ -1154,6 +1190,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                     if sig:
                         with _sig_lock:
                             _thought_signatures[call_id] = sig
+                        _save_thought_signatures()
                     tool_calls.append({
                         "id": call_id,
                         "type": "function",
@@ -1238,6 +1275,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                             if sig:
                                 with _sig_lock:
                                     _thought_signatures[call_id] = sig
+                                _save_thought_signatures()
 
                             args_obj = fc.get("args", {})
                             args_str = json.dumps(args_obj, sort_keys=True)
