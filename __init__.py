@@ -901,19 +901,16 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             gen_config["temperature"] = 0.7
 
         max_toks = req_json.get("max_tokens") or req_json.get("max_completion_tokens")
-        if max_toks is not None:
-            # Respect user's max_tokens but ensure at least 8192 for tool-use.
-            # Cap at 8192 for flash-low, 16384 for flash-medium, 32768 for flash-high
-            resolved = resolve_internal_model(req_model)
-            if "low" in resolved:
-                cap = 8192
-            elif "high" in resolved:
-                cap = 32768
-            else:
-                cap = 16384
-            gen_config["maxOutputTokens"] = min(max(int(max_toks), 4096), cap)
+        # Gemini 2.5 Flash supports up to 65536 output tokens
+        resolved = resolve_internal_model(req_model)
+        if "low" in resolved:
+            cap = 16384
         else:
-            gen_config["maxOutputTokens"] = 8192
+            cap = 65536  # flash / flash-high both support 65k
+        if max_toks is not None:
+            gen_config["maxOutputTokens"] = min(max(int(max_toks), 8192), cap)
+        else:
+            gen_config["maxOutputTokens"] = cap
 
         gemini_body = {"contents": gemini_contents, "generationConfig": gen_config}
         if system_instruction:
