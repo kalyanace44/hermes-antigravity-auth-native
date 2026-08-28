@@ -1054,8 +1054,8 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                             with _cache_lock:
                                 failures = _consecutive_failures.get(cooldown_key, 0) + 1
                                 _consecutive_failures[cooldown_key] = failures
-                                # Short cooldown for first failure (10s), escalate on repeated
-                                cooldown_duration = {1: 10, 2: 30, 3: 120}.get(failures, 300)
+                                # Short cooldown: 5s first, then 15s, then 30s max
+                                cooldown_duration = {1: 5, 2: 15, 3: 30}.get(failures, 60)
                                 _cooldown_cache[cooldown_key] = time.time() + cooldown_duration
                                 _token_cache.pop(email, None)
                                 _project_cache.pop(email, None)
@@ -1104,8 +1104,8 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                             shortest_wait = wait
                             shortest_key = ck
 
-            if shortest_wait is not None and shortest_wait <= 30:
-                # Wait up to 30s for the shortest cooldown to expire, then clear it and retry
+            if shortest_wait is not None and shortest_wait <= 120:
+                # Wait up to 120s for the shortest cooldown to expire, then clear it and retry
                 time.sleep(shortest_wait + 0.5)
                 with _cache_lock:
                     _cooldown_cache.pop(shortest_key, None)
