@@ -799,8 +799,15 @@ def translate_openai_to_gemini(messages, is_claude=False):
                 if "functionCall" in p and not p.get("thoughtSignature"):
                     fc = p["functionCall"]
                     fname = fc.get("name", "tool")
-                    fargs = fc.get("args", {})
-                    item["parts"][i] = {"text": f"Executed tool {fname} with arguments {json.dumps(fargs)}"}
+                    # A signature-less functionCall can't be sent natively (Gemini
+                    # rejects it), so we must textualize it. CRITICAL: do NOT use a
+                    # callable-looking template like "Executed tool NAME with
+                    # arguments {json}" — Gemini reads its own history and learns to
+                    # mimic that shape, emitting future tool calls as PLAIN TEXT
+                    # instead of native functionCalls (causing tool-call loops).
+                    # Use a neutral past-tense note with no tool syntax and no args
+                    # blob. The paired functionResponse still carries the result.
+                    item["parts"][i] = {"text": f"(Earlier in this conversation, the {fname} step was already completed; its result is included below.)"}
 
     return merged, system_parts
 
