@@ -19,6 +19,19 @@ logger = logging.getLogger("antigravity")
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def _normalize_tool_name(name):
+    """Gemini sometimes emits functionCall names prefixed with its internal
+    'default_api.' (or 'default_api:') namespace, e.g. 'default_api.search_files'
+    instead of 'search_files'. Hermes can't match the prefixed name to the real
+    tool, so it renders the call as raw text. Strip the prefix so the tool matches."""
+    if not name:
+        return name
+    for prefix in ("default_api.", "default_api:", "functions.", "tools."):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
 
 # ── Configuration ─────────────────────────────────────────────
 PROXY_PORT = 8999
@@ -1198,7 +1211,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                     tool_calls.append({
                         "id": call_id,
                         "type": "function",
-                        "function": {"name": fc.get("name", ""), "arguments": json.dumps(fc.get("args", {}))}
+                        "function": {"name": _normalize_tool_name(fc.get("name", "")), "arguments": json.dumps(fc.get("args", {}))}
                     })
             if tool_calls:
                 finish_reason = "tool_calls"
@@ -1283,7 +1296,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
 
                             args_obj = fc.get("args", {})
                             args_str = json.dumps(args_obj, sort_keys=True)
-                            call_key = (call_id, fc.get("name", ""), args_str)
+                            call_key = (call_id, _normalize_tool_name(fc.get("name", "")), args_str)
 
                             if call_key not in emitted_call_keys:
                                 emitted_call_keys.add(call_key)
@@ -1291,7 +1304,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                                     "index": tool_idx,
                                     "id": call_id,
                                     "type": "function",
-                                    "function": {"name": fc.get("name", ""), "arguments": json.dumps(args_obj)}
+                                    "function": {"name": _normalize_tool_name(fc.get("name", "")), "arguments": json.dumps(args_obj)}
                                 })
                             tool_idx += 1
 
