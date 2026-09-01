@@ -19,6 +19,130 @@ logger = logging.getLogger("antigravity")
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def _recover_text_tool_calls(text, known_names):
+    """Gemini via Antigravity sometimes LEAKS a tool call as plain TEXT instead of
+    emitting a native functionCall part (Hermes then renders it as
+    'Executed tool <name> with arguments {...}' but never runs it).
+
+    This recovers such calls. It is intentionally conservative: it only fires for
+    tool names that Hermes actually sent (known_names), so normal prose can never
+    be misread as a call. Returns (recovered_calls, cleaned_text).
+
+    Handles several observed leak shapes:
+      Executed tool NAME with arguments {json}
+      default_api.NAME(key=val, ...)
+      default_api:NAME{key:val, ...}
+      print(default_api.NAME(...))
+      NAME({json})
+    """
+    if not text or not known_names:
+        return [], text
+    known = set(known_names)
+    recovered = []
+    spans = []
+
+    # Shape 1: Executed tool NAME with arguments {json}
+    for m in re.finditer(r'Executed tool\s+([A-Za-z_][\w]*)\s+with arguments\s*(\{.*?\})(?=\s*(?:Executed tool|\Z|\n))', text, re.DOTALL):
+        name, args_raw = m.group(1), m.group(2)
+        if name not in known:
+            continue
+        args = _coerce_args(args_raw)
+        if args is None:
+            continue
+        recovered.append((name, args))
+        spans.append((m.start(), m.end()))
+
+    # Shape 2: default_api.NAME(...) or default_api:NAME(...) or NAME({...})
+    for m in re.finditer(r'(?:default_api[.:]|functions\.|tools\.)?([A-Za-z_][\w]*)\s*[({]', text):
+        name = m.group(1)
+        if name not in known:
+            continue
+        # Extract balanced (...) or {...} following the name
+        open_ch = text[m.end() - 1]
+        close_ch = ')' if open_ch == '(' else '}'
+        depth, i = 1, m.end()
+        while i < len(text) and depth > 0:
+            if text[i] == open_ch:
+                depth += 1
+            elif text[i] == close_ch:
+                depth -= 1
+            i += 1
+        if depth != 0:
+            continue
+        inner = text[m.end():i - 1]
+        args = _coerce_args(inner if open_ch == '{' else "{" + _kwargs_to_json(inner) + "}")
+        if args is None:
+            continue
+        # Skip if this span overlaps a Shape-1 match already recovered
+        if any(s <= m.start() < e for s, e in spans):
+            continue
+        recovered.append((name, args))
+        spans.append((m.start(), i))
+
+    if not recovered:
+        return [], text
+
+    # Strip recovered spans from the visible text
+    spans.sort()
+    cleaned, last = [], 0
+    for s, e in spans:
+        cleaned.append(text[last:s])
+        last = e
+    cleaned.append(text[last:])
+    return recovered, "".join(cleaned).strip()
+
+
+def _coerce_args(raw):
+    """Parse a leaked args blob into a dict. Tries strict JSON, then a lenient
+    key:val / key=val fallback. Returns None if it can't be parsed."""
+    raw = raw.strip()
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+    # Lenient: {path:/x, pattern:status} style (unquoted)
+    inner = raw
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1]
+    try:
+        return json.loads("{" + _kwargs_to_json(inner) + "}")
+    except Exception:
+        return None
+
+
+def _kwargs_to_json(inner):
+    """Convert 'key=val, key2="v2"' or 'key:val' fragments into JSON k/v pairs."""
+    parts = []
+    for chunk in re.split(r',(?![^{\[]*[}\]])', inner):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.match(r'^([A-Za-z_][\w]*)\s*[:=]\s*(.*)$', chunk, re.DOTALL)
+        if not m:
+            continue
+        k, v = m.group(1), m.group(2).strip()
+        if not (v.startswith('"') or v.startswith("'") or v.lstrip("-").replace(".", "", 1).isdigit() or v in ("true", "false", "null")):
+            v = json.dumps(v)
+        elif v.startswith("'") and v.endswith("'"):
+            v = json.dumps(v[1:-1])
+        parts.append(f'{json.dumps(k)}: {v}')
+    return ", ".join(parts)
+
+
+def _debug_dump_leak(text, tag):
+    """Capture raw Gemini text that looks like a leaked tool call, for diagnosis."""
+    try:
+        path = os.path.expanduser("~/.hermes/logs/antigravity-textleak.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(f"\n===== {tag} @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.write(text[:4000])
+            f.write("\n")
+    except Exception:
+        pass
+
+
 def _normalize_tool_name(name):
     """Gemini sometimes emits functionCall names prefixed with its internal
     'default_api.' (or 'default_api:') namespace, e.g. 'default_api.search_files'
@@ -1175,13 +1299,20 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         # ── Quota warning DISABLED (was spamming chat) ──────────────────
         quota_warning = None
 
+        # Tool names Hermes actually sent — used to safely recover text-leaked calls
+        known_tool_names = []
+        for t in (req_json.get("tools") or []):
+            fn = (t or {}).get("function", {})
+            if fn.get("name"):
+                known_tool_names.append(fn["name"])
+
         # ── Handle response ───────────────────────────────────
         if stream:
-            self._handle_stream_response(resp, req_model, quota_warning)
+            self._handle_stream_response(resp, req_model, quota_warning, known_tool_names)
         else:
-            self._handle_sync_response(resp, req_model, quota_warning)
+            self._handle_sync_response(resp, req_model, quota_warning, known_tool_names)
 
-    def _handle_sync_response(self, resp, req_model, quota_warning=None):
+    def _handle_sync_response(self, resp, req_model, quota_warning=None, known_tool_names=None):
         """Parse non-streaming Gemini response → OpenAI format."""
         try:
             res_data = json.loads(resp.read().decode("utf-8"))
@@ -1216,6 +1347,21 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             if tool_calls:
                 finish_reason = "tool_calls"
 
+        # Recover tool calls that Gemini leaked as plain text (no native functionCall).
+        # Only when zero native calls were parsed, so normal responses are untouched.
+        if not tool_calls and text and known_tool_names:
+            recovered, cleaned = _recover_text_tool_calls(text, known_tool_names)
+            if recovered:
+                _debug_dump_leak(text, "sync")
+                for name, args in recovered:
+                    tool_calls.append({
+                        "id": f"call_{int(time.time()*1000)}_{len(tool_calls)}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args)}
+                    })
+                text = cleaned
+                finish_reason = "tool_calls"
+
         msg_obj = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg_obj["tool_calls"] = tool_calls
@@ -1242,7 +1388,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(resp_bytes)
         self.wfile.flush()
 
-    def _handle_stream_response(self, resp, req_model, quota_warning=None):
+    def _handle_stream_response(self, resp, req_model, quota_warning=None, known_tool_names=None):
         """Parse streaming Gemini SSE → OpenAI SSE format."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -1252,6 +1398,7 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
 
         stream_call_ids = {}      # idx -> call_id
         emitted_call_keys = set() # (call_id, func_name, args_str)
+        full_text = ""            # accumulated text across chunks, for text-leak recovery
 
         try:
             while True:
@@ -1320,6 +1467,8 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                     elif raw_reason:
                         finish_reason = "stop"
 
+                full_text += text
+
                 delta = {}
                 if text:
                     delta["content"] = text
@@ -1343,6 +1492,32 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
 
                 if finish_reason:
+                    # If Gemini leaked a tool call as plain text (no native
+                    # functionCall was ever emitted this stream) recover it now so
+                    # the tool actually RUNS instead of just being shown as text.
+                    if not emitted_call_keys and full_text and known_tool_names:
+                        recovered, _cleaned = _recover_text_tool_calls(full_text, known_tool_names)
+                        if recovered:
+                            _debug_dump_leak(full_text, "stream")
+                            rec_calls = []
+                            for ri, (rname, rargs) in enumerate(recovered):
+                                rec_calls.append({
+                                    "index": ri,
+                                    "id": f"call_{int(time.time()*1000)}_{ri}",
+                                    "type": "function",
+                                    "function": {"name": rname, "arguments": json.dumps(rargs)}
+                                })
+                            rec_chunk = {
+                                "id": f"chatcmpl-{int(time.time()*1000)}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": req_model,
+                                "choices": [{"delta": {"tool_calls": rec_calls}, "index": 0, "finish_reason": None}]
+                            }
+                            self.wfile.write(f"data: {json.dumps(rec_chunk)}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                            finish_reason = "tool_calls"
+
                     # Emit the finish chunk separately with empty delta so the
                     # finish_reason is never accidentally skipped.
                     fin_chunk = {
