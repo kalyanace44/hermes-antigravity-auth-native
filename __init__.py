@@ -941,6 +941,34 @@ class AntigravityProxyHandler(BaseHTTPRequestHandler):
             gen_config["maxOutputTokens"] = cap
 
         gemini_body = {"contents": gemini_contents, "generationConfig": gen_config}
+
+        # ── PASSIVE image diagnostic (no behavior change) ──────────────
+        # Captures the shape of any request containing an image so we can see
+        # WHY image analysis is slow / takes many calls (e.g. image re-sent
+        # every turn, oversized payload). Logs only when an image is present.
+        try:
+            _img_turns = []
+            _total_img_bytes = 0
+            for _ci, _c in enumerate(gemini_contents):
+                _imgs_here = 0
+                for _p in _c.get("parts", []):
+                    _idata = _p.get("inlineData")
+                    if _idata and _idata.get("data"):
+                        _imgs_here += 1
+                        _total_img_bytes += len(_idata["data"])
+                if _imgs_here:
+                    _img_turns.append((_ci, _c.get("role"), _imgs_here))
+            if _img_turns:
+                _dbg = os.path.expanduser("~/.hermes/logs/antigravity-image.log")
+                os.makedirs(os.path.dirname(_dbg), exist_ok=True)
+                with open(_dbg, "a") as _f:
+                    _f.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} model={req_model} stream={stream} =====\n")
+                    _f.write(f"total_turns={len(gemini_contents)} turns_with_images={_img_turns}\n")
+                    _f.write(f"total_image_b64_bytes={_total_img_bytes} (~{_total_img_bytes//1024}KB re-sent this request)\n")
+                    _f.write(f"maxOutputTokens={gen_config.get('maxOutputTokens')}\n")
+        except Exception:
+            pass
+        # ───────────────────────────────────────────────────────────────
         if system_instruction:
             gemini_body["systemInstruction"] = {"parts": system_instruction}
         if gemini_tools:
