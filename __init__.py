@@ -708,7 +708,15 @@ def translate_openai_to_gemini(messages, is_claude=False):
                         if sig:
                             part_obj["thoughtSignature"] = sig
                         else:
-                            part_obj = {"text": f"Executed tool {name} with arguments {json.dumps(args)}"}
+                            # No thoughtSignature — can't send this call natively
+                            # (Gemini rejects it). Textualize it, but NOT with a
+                            # callable-looking "Executed tool NAME with arguments
+                            # {json}" template: Gemini reads its own history and
+                            # mimics that shape, emitting future tool calls as plain
+                            # text instead of native functionCalls (tool-call loops).
+                            # Neutral past-tense note; the functionResponse carries
+                            # the actual result.
+                            part_obj = {"text": f"(Earlier in this conversation, the {name} step was already completed; its result is included below.)"}
                     parts.append(part_obj)
 
         if not parts:
